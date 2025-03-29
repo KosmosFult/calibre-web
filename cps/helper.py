@@ -54,7 +54,7 @@ except ImportError as e:
 from . import calibre_db, cli_param
 from .string_helper import strip_whitespaces
 from .tasks.convert import TaskConvert
-from . import logger, config, db, ub, fs
+from . import logger, config, db, ub, fs, calibre_redis_client
 from . import gdriveutils as gd
 from .constants import (STATIC_DIR as _STATIC_DIR, CACHE_TYPE_THUMBNAILS, THUMBNAIL_TYPE_COVER, THUMBNAIL_TYPE_SERIES,
                         SUPPORTED_CALIBRE_BINARIES)
@@ -1102,6 +1102,7 @@ def get_download_link(book_id, book_format, client):
             # collect downloaded books only for registered user and not for anonymous user
             if current_user.is_authenticated:
                 ub.update_download(book_id, int(current_user.id))
+                calibre_redis_client.increment_download(book_id)
             file_name = book.title
             if len(book.authors) > 0:
                 file_name = file_name + ' - ' + book.authors[0].name

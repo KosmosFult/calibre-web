@@ -25,6 +25,8 @@ import sys
 import os
 import mimetypes
 
+import redis
+
 from flask import Flask
 from .MyLoginManager import MyLoginManager
 from flask_principal import Principal
@@ -38,6 +40,7 @@ from .updater import Updater
 from . import config_sql
 from . import cache_buster
 from . import ub, db
+from .calibre_redis import CalibreRedis
 
 try:
     from flask_limiter import Limiter
@@ -104,6 +107,12 @@ else:
     csrf = None
 
 calibre_db = db.CalibreDB(app)
+
+calibre_redis_client = CalibreRedis(
+    host='localhost',
+    port=6379,
+    db=0
+)
 
 web_server = WebServer()
 
@@ -213,6 +222,9 @@ def create_app():
     from .schedule import register_scheduled_tasks, register_startup_tasks
     register_scheduled_tasks(config.schedule_reconnect)
     register_startup_tasks()
+    
+    calibre_redis_client.init_redis_data(config, calibre_db, db, app)
+    calibre_redis_client.start_sync_task(app)
 
     return app
 

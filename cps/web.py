@@ -41,7 +41,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 from . import constants, logger, isoLanguages, services
 from . import db, ub, config, app
-from . import calibre_db, kobo_sync_status
+from . import calibre_db, kobo_sync_status, calibre_redis_client
 from .search import render_search_results, render_adv_search_results
 from .gdriveutils import getFileFromEbooksFolder, do_gdrive_download
 from .helper import check_valid_domain, check_email, check_username, \
@@ -453,13 +453,46 @@ def render_discover_books(book_id):
         abort(404)
 
 
+# def render_hot_books(page, order):
+#     if current_user.check_visibility(constants.SIDEBAR_HOT):
+#         if order[1] not in ['hotasc', 'hotdesc']:
+#             # Unary expression comparison only working (for this expression) in sqlalchemy 1.4+
+#             # if not (order[0][0].compare(func.count(ub.Downloads.book_id).desc()) or
+#             #        order[0][0].compare(func.count(ub.Downloads.book_id).asc())):
+#             order = [func.count(ub.Downloads.book_id).desc()], 'hotdesc'
+#         if current_user.show_detail_random():
+#             random_query = calibre_db.generate_linked_query(config.config_read_column, db.Books)
+#             random = (random_query.filter(calibre_db.common_filters())
+#                      .order_by(func.random())
+#                      .limit(config.config_random_books).all())
+#         else:
+#             random = false()
+
+#         off = int(int(config.config_books_per_page) * (page - 1))
+#         all_books = ub.session.query(ub.Downloads, func.count(ub.Downloads.book_id)) \
+#             .order_by(*order[0]).group_by(ub.Downloads.book_id)
+#         hot_books = all_books.offset(off).limit(config.config_books_per_page)
+#         entries = list()
+#         for book in hot_books:
+#             query = calibre_db.generate_linked_query(config.config_read_column, db.Books)
+#             download_book = query.filter(calibre_db.common_filters()).filter(
+#                 book.Downloads.book_id == db.Books.id).first()
+#             if download_book:
+#                 entries.append(download_book)
+#             else:
+#                 ub.delete_download(book.Downloads.book_id)
+#         num_books = entries.__len__()
+#         pagination = Pagination(page, config.config_books_per_page, num_books)
+#         return render_title_template('index.html', random=random, entries=entries, pagination=pagination,
+#                                      title=_("Hot Books (Most Downloaded)"), page="hot", order=order[1])
+#     else:
+#         abort(404)
+        
 def render_hot_books(page, order):
+
     if current_user.check_visibility(constants.SIDEBAR_HOT):
-        if order[1] not in ['hotasc', 'hotdesc']:
-            # Unary expression comparison only working (for this expression) in sqlalchemy 1.4+
-            # if not (order[0][0].compare(func.count(ub.Downloads.book_id).desc()) or
-            #        order[0][0].compare(func.count(ub.Downloads.book_id).asc())):
-            order = [func.count(ub.Downloads.book_id).desc()], 'hotdesc'
+        calibre_redis_client.init_redis_data(config, calibre_db, db, app)
+        
         if current_user.show_detail_random():
             random_query = calibre_db.generate_linked_query(config.config_read_column, db.Books)
             random = (random_query.filter(calibre_db.common_filters())
@@ -468,26 +501,22 @@ def render_hot_books(page, order):
         else:
             random = false()
 
-        off = int(int(config.config_books_per_page) * (page - 1))
-        all_books = ub.session.query(ub.Downloads, func.count(ub.Downloads.book_id)) \
-            .order_by(*order[0]).group_by(ub.Downloads.book_id)
-        hot_books = all_books.offset(off).limit(config.config_books_per_page)
         entries = list()
-        for book in hot_books:
+        hot_books = calibre_redis_client.get_top_books(config.config_books_per_page)
+        for book_id, count in hot_books:
             query = calibre_db.generate_linked_query(config.config_read_column, db.Books)
             download_book = query.filter(calibre_db.common_filters()).filter(
-                book.Downloads.book_id == db.Books.id).first()
+                book_id == db.Books.id).first()
             if download_book:
                 entries.append(download_book)
             else:
-                ub.delete_download(book.Downloads.book_id)
+                ub.delete_download(book_id)
         num_books = entries.__len__()
         pagination = Pagination(page, config.config_books_per_page, num_books)
         return render_title_template('index.html', random=random, entries=entries, pagination=pagination,
                                      title=_("Hot Books (Most Downloaded)"), page="hot", order=order[1])
     else:
         abort(404)
-
 
 def render_downloaded_books(page, order, user_id):
     if current_user.role_admin():

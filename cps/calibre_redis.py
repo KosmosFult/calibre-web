@@ -18,7 +18,7 @@ class CalibreRedis:
         self.calibre_db = None
         self.db = None
         self.inited = False
-        self.sync_interval = 3600
+        self.sync_interval = 3600 * 24
 
     def init_redis_data(self, config, calibre_db, db, app):
         if(self.inited):

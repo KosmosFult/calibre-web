@@ -1,0 +1,168 @@
+# Calibre-Web Configuration File
+# ====================================
+# 这个配置文件中的设置会覆盖数据库中的默认配置
+# 注释掉的选项表示使用默认值
+
+# 服务器配置
+server:
+  # 监听地址 (0.0.0.0 表示所有网卡, 127.0.0.1 仅本地)
+  host: 0.0.0.0
+  
+  # 监听端口
+  port: 8089
+  
+  # 外部访问端口（如果使用反向代理）
+  # external_port: 443
+  
+  # SSL 配置（HTTPS）
+  # ssl:
+  #   cert_file: /path/to/cert.pem
+  #   key_file: /path/to/key.pem
+
+# Calibre 数据库配置
+calibre:
+  # Calibre 数据库目录（包含 metadata.db 的目录）
+  # library_path: ./library
+  
+  # Google Drive 集成
+  # use_google_drive: false
+  # google_drive_folder: ""
+
+# 应用配置
+app:
+  # 站点标题
+  title: "Calibre-Web"
+  
+  # 每页显示的书籍数量
+  books_per_page: 60
+  
+  # 随机书籍显示数量
+  random_books: 4
+  
+  # 主题 (0=默认)
+  theme: 0
+  
+  # 允许匿名浏览
+  anonymous_browse: false
+  
+  # 允许公开注册
+  public_registration: false
+  
+  # 允许上传
+  allow_upload: false
+  
+  # 上传格式限制 (逗号分隔)
+  # upload_formats: "epub,pdf,mobi,azw3,txt,fb2,lit,lrf,doc,docx"
+
+# 日志配置
+logging:
+  # 日志级别: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+  
+  # 日志文件路径（留空则输出到控制台）
+  # file: /var/log/calibre-web/app.log
+  
+  # 访问日志
+  access_log:
+    enabled: false
+    # file: /var/log/calibre-web/access.log
+
+# 邮件配置（用于发送电子书到 Kindle 等）
+mail:
+  # server: smtp.gmail.com
+  # port: 587
+  # use_ssl: true
+  # login: your-email@gmail.com
+  # password: your-password
+  # from: "Calibre-Web <your-email@gmail.com>"
+  # size_limit: 26214400  # 25MB in bytes
+
+# 认证配置
+auth:
+  # 登录类型: 0=标准, 1=LDAP
+  type: 0
+  
+  # 是否需要邮箱验证注册
+  register_email: false
+  
+  # 远程登录（Magic Link）
+  remote_login: false
+  
+  # Session 保护级别 (0=basic, 1=strong)
+  session_protection: 0
+
+# LDAP 配置 (当 auth.type = 1 时生效)
+# ldap:
+#   provider_url: ldap://example.com
+#   port: 389
+#   use_ssl: false
+#   username: "cn=admin,dc=example,dc=org"
+#   password: "password"
+#   dn: "dc=example,dc=org"
+#   user_object: "uid=%s"
+#   group_name: "calibreweb"
+
+# OAuth 配置
+# oauth:
+#   google:
+#     enabled: false
+#     client_id: ""
+#     client_secret: ""
+#   github:
+#     enabled: false
+#     client_id: ""
+#     client_secret: ""
+
+# Kobo 同步
+kobo:
+  sync: false
+  proxy: false
+
+# 外部服务
+services:
+  # Goodreads API
+  # goodreads:
+  #   enabled: false
+  #   api_key: ""
+  
+  # Google Books API
+  # google_books:
+  #   api_key: ""
+
+# 转换工具路径
+converters:
+  # Calibre ebook-convert 路径
+  # calibre_path: /usr/bin/ebook-convert
+  
+  # Kepubify 路径（用于 Kobo）
+  # kepubify_path: /opt/kepubify/kepubify
+  
+  # Unrar 路径
+  # unrar_path: /usr/bin/unrar
+
+# 速率限制（防止滥用）
+rate_limit:
+  enabled: true
+  # 后端存储 URI (留空使用内存)
+  # storage_uri: "redis://localhost:6379"
+  # storage_options: ""
+
+# 高级选项
+advanced:
+  # 允许从 localhost 加载封面
+  allow_localhost: false
+  
+  # 启用重连接端点 (用于 Docker)
+  enable_reconnect: false
+  
+  # Unicode 文件名支持
+  unicode_filename: false
+  
+  # 信任的主机列表（逗号分隔）
+  # trusted_hosts: "example.com,sub.example.com"
+
+# 自定义配置（扩展用）
+# custom:
+#   your_feature_1: value1
+#   your_feature_2: value2
+

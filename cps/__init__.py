@@ -120,6 +120,13 @@ def create_app():
         csrf.init_app(app)
 
     cli_param.init()
+    
+    # Load YAML configuration
+    from .config_loader import get_yaml_loader
+    yaml_loader = get_yaml_loader()
+    
+    # Apply YAML config to CLI parameters
+    yaml_loader.apply_to_cli_params(cli_param)
 
     ub.init_db(cli_param.settings_path)
     # pylint: disable=no-member
@@ -127,6 +134,9 @@ def create_app():
 
     config_sql.load_configuration(ub.session, encrypt_key)
     config.init_config(ub.session, encrypt_key, cli_param)
+    
+    # Apply YAML config to database config (overrides database defaults)
+    yaml_loader.apply_to_config(config)
 
     if error:
         log.error(error)

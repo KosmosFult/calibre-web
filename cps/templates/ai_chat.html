@@ -10,17 +10,17 @@
     <style>
         /* 自定义滚动条 */
         ::-webkit-scrollbar {
-            width: 8px;
+            width: 6px;
         }
         ::-webkit-scrollbar-track {
-            background: #f1f1f1; 
+            background: transparent; 
         }
         ::-webkit-scrollbar-thumb {
-            background: #c1c1c1; 
-            border-radius: 4px;
+            background: #d1d5db; 
+            border-radius: 3px;
         }
         ::-webkit-scrollbar-thumb:hover {
-            background: #a8a8a8; 
+            background: #9ca3af; 
         }
         .typing-cursor::after {
             content: '▋';
@@ -30,85 +30,165 @@
         @keyframes blink {
             50% { opacity: 0; }
         }
+        [v-cloak] { display: none; }
     </style>
 </head>
 <body class="bg-gray-100 h-screen flex flex-col overflow-hidden font-sans">
-    <div id="app" class="flex flex-col h-full max-w-4xl mx-auto w-full bg-white shadow-xl rounded-none md:rounded-lg md:my-4 overflow-hidden">
+    <div id="app" v-cloak class="flex h-full max-w-7xl mx-auto w-full bg-white shadow-xl rounded-none md:rounded-lg md:my-4 overflow-hidden">
         
-        <!-- Header -->
-        <header class="bg-blue-600 text-white p-4 flex justify-between items-center shrink-0 z-10 shadow-md">
-            <div class="flex items-center space-x-2">
-                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
-                </svg>
-                <h1 class="text-lg font-semibold">AI 图书管家 (Demo)</h1>
-            </div>
-            <a href="/" class="text-sm opacity-80 hover:opacity-100 transition">返回书库</a>
-        </header>
-
-        <!-- Chat Area -->
-        <main ref="chatContainer" class="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50">
-            <div v-if="messages.length === 0" class="h-full flex flex-col items-center justify-center text-gray-400 space-y-4">
-                <svg class="w-16 h-16 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path>
-                </svg>
-                <p class="text-center">你可以问我关于馆藏书籍的问题，<br>例如“推荐几本好看的科幻小说”</p>
-            </div>
-
-            <template v-for="(msg, index) in messages" :key="index">
-                <!-- User Message -->
-                <div v-if="msg.role === 'user'" class="flex justify-end">
-                    <div class="bg-blue-500 text-white px-4 py-2 rounded-2xl rounded-tr-none max-w-[80%] shadow-sm">
-                        [[ msg.content ]]
-                    </div>
-                </div>
-
-                <!-- AI Message -->
-                <div v-else class="flex justify-start">
-                    <div class="bg-white border border-gray-200 text-gray-800 px-4 py-2 rounded-2xl rounded-tl-none max-w-[80%] shadow-sm">
-                        <div class="prose prose-sm max-w-none whitespace-pre-wrap" :class="{ 'typing-cursor': msg.streaming }">[[ msg.content ]]</div>
-                    </div>
-                </div>
-            </template>
-        </main>
-
-        <!-- Input Area -->
-        <footer class="p-4 bg-white border-t border-gray-100 shrink-0">
-            <form @submit.prevent="sendMessage" class="flex space-x-2 relative">
-                <input 
-                    v-model="inputMessage" 
-                    type="text" 
-                    placeholder="输入你的问题..." 
-                    class="flex-1 px-4 py-2 border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition disabled:opacity-50 disabled:bg-gray-100"
-                    :disabled="isLoading"
-                >
-                <button 
-                    type="submit" 
-                    class="bg-blue-600 text-white rounded-full w-10 h-10 flex items-center justify-center hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition"
-                    :disabled="isLoading || !inputMessage.trim()"
-                >
-                    <svg v-if="!isLoading" class="w-5 h-5 transform rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
-                    </svg>
-                    <svg v-else class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        <!-- Sidebar -->
+        <aside class="w-64 bg-gray-50 border-r border-gray-200 flex flex-col shrink-0">
+            <div class="p-4 border-b border-gray-200 flex justify-between items-center">
+                <h2 class="font-semibold text-gray-700">历史对话</h2>
+                <button @click="createNewSession" class="text-blue-600 hover:bg-blue-50 p-1 rounded transition" title="新建对话">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path>
                     </svg>
                 </button>
-            </form>
-        </footer>
+            </div>
+            
+            <div class="flex-1 overflow-y-auto p-2 space-y-1">
+                <div 
+                    v-for="session in sessions" 
+                    :key="session.id"
+                    @click="selectSession(session)"
+                    class="group flex items-center justify-between p-2 rounded cursor-pointer transition text-sm"
+                    :class="currentSessionId === session.id ? 'bg-blue-100 text-blue-800' : 'hover:bg-gray-100 text-gray-700'"
+                >
+                    <div class="truncate flex-1 mr-2">
+                        <div class="font-medium truncate">[[ session.title || '新对话' ]]</div>
+                        <div class="text-xs text-gray-400">[[ formatDate(session.updated_at) ]]</div>
+                    </div>
+                    <button 
+                        @click.stop="deleteSession(session.id)" 
+                        class="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 p-1 transition"
+                        title="删除"
+                    >
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                        </svg>
+                    </button>
+                </div>
+                
+                <div v-if="sessions.length === 0" class="text-center text-gray-400 text-sm py-8">
+                    暂无历史对话<br>点击上方 + 号新建
+                </div>
+            </div>
+            
+            <div class="p-4 border-t border-gray-200">
+                <a href="/" class="flex items-center text-sm text-gray-600 hover:text-blue-600 transition">
+                    <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path>
+                    </svg>
+                    返回书库
+                </a>
+            </div>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <div class="flex-1 flex flex-col h-full min-w-0">
+            <!-- Header -->
+            <header class="bg-white border-b border-gray-200 p-4 flex justify-between items-center shrink-0">
+                <div class="flex items-center space-x-2 overflow-hidden">
+                    <svg class="w-6 h-6 text-blue-600 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path>
+                    </svg>
+                    <h1 class="text-lg font-semibold text-gray-800 truncate">[[ currentSessionTitle || 'AI 图书管家' ]]</h1>
+                </div>
+            </header>
+
+            <!-- Chat Messages -->
+            <main ref="chatContainer" class="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50">
+                <div v-if="!currentSessionId" class="h-full flex flex-col items-center justify-center text-gray-400 space-y-4">
+                    <svg class="w-16 h-16 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path>
+                    </svg>
+                    <p class="text-center">请选择一个对话或新建对话</p>
+                    <button @click="createNewSession" class="bg-blue-600 text-white px-6 py-2 rounded-full hover:bg-blue-700 transition shadow">
+                        新建对话
+                    </button>
+                </div>
+                
+                <div v-else-if="messages.length === 0" class="h-full flex flex-col items-center justify-center text-gray-400 space-y-4">
+                    <p class="text-center">你可以问我关于馆藏书籍的问题，<br>例如“推荐几本好看的科幻小说”</p>
+                </div>
+
+                <template v-for="(msg, index) in messages" :key="index">
+                    <!-- User Message -->
+                    <div v-if="msg.role === 'user'" class="flex justify-end">
+                        <div class="bg-blue-500 text-white px-4 py-2 rounded-2xl rounded-tr-none max-w-[80%] shadow-sm">
+                            [[ msg.content ]]
+                        </div>
+                    </div>
+
+                    <!-- AI Message -->
+                    <div v-else-if="msg.role === 'assistant' || msg.role === 'ai'" class="flex justify-start">
+                        <div class="bg-white border border-gray-200 text-gray-800 px-4 py-2 rounded-2xl rounded-tl-none max-w-[80%] shadow-sm">
+                            <div class="prose prose-sm max-w-none whitespace-pre-wrap" :class="{ 'typing-cursor': msg.streaming }">[[ msg.content ]]</div>
+                        </div>
+                    </div>
+                    
+                     <!-- System/Tool Message (Optional: hidden or styled differently) -->
+                    <div v-else class="flex justify-center">
+                         <div class="text-xs text-gray-400 bg-gray-100 px-2 py-1 rounded">
+                             [[ msg.role ]]: [[ msg.content ]]
+                         </div>
+                    </div>
+                </template>
+            </main>
+
+            <!-- Input Area -->
+            <footer class="p-4 bg-white border-t border-gray-100 shrink-0">
+                <form @submit.prevent="sendMessage" class="flex space-x-2 relative">
+                    <input 
+                        v-model="inputMessage" 
+                        type="text" 
+                        placeholder="输入你的问题..." 
+                        class="flex-1 px-4 py-2 border border-gray-300 rounded-full focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition disabled:opacity-50 disabled:bg-gray-100"
+                        :disabled="isLoading || !currentSessionId"
+                    >
+                    <button 
+                        type="submit" 
+                        class="bg-blue-600 text-white rounded-full w-10 h-10 flex items-center justify-center hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                        :disabled="isLoading || !inputMessage.trim() || !currentSessionId"
+                    >
+                        <svg v-if="!isLoading" class="w-5 h-5 transform rotate-90" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
+                        </svg>
+                        <svg v-else class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                    </button>
+                </form>
+            </footer>
+        </div>
     </div>
 
     <script>
-        const { createApp, ref, nextTick, onMounted } = Vue
+        const { createApp, ref, nextTick, onMounted, computed } = Vue
 
         createApp({
             delimiters: ['[[', ']]'],
             setup() {
+                const sessions = ref([])
                 const messages = ref([])
                 const inputMessage = ref('')
                 const isLoading = ref(false)
+                const currentSessionId = ref(null)
                 const chatContainer = ref(null)
+                const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content')
+
+                const currentSessionTitle = computed(() => {
+                    const s = sessions.value.find(s => s.id === currentSessionId.value)
+                    return s ? s.title : ''
+                })
+
+                const formatDate = (isoString) => {
+                    if (!isoString) return ''
+                    const date = new Date(isoString)
+                    return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})
+                }
 
                 const scrollToBottom = async () => {
                     await nextTick()
@@ -117,29 +197,101 @@
                     }
                 }
 
+                const fetchSessions = async () => {
+                    try {
+                        const res = await fetch('/ai/sessions')
+                        if (res.ok) {
+                            sessions.value = await res.json()
+                        }
+                    } catch (e) {
+                        console.error("Fetch sessions error:", e)
+                    }
+                }
+
+                const createNewSession = async () => {
+                    try {
+                        const res = await fetch('/ai/sessions', {
+                            method: 'POST',
+                            headers: { 
+                                'Content-Type': 'application/json',
+                                'X-CSRFToken': csrfToken 
+                            }
+                        })
+                        if (res.ok) {
+                            const newSession = await res.json()
+                            sessions.value.unshift(newSession) // Add to top
+                            selectSession(newSession)
+                        }
+                    } catch (e) {
+                        console.error("Create session error:", e)
+                    }
+                }
+
+                const deleteSession = async (id) => {
+                    if (!confirm('确定要删除这个对话吗？')) return
+                    
+                    try {
+                        const res = await fetch(`/ai/sessions/${id}`, {
+                            method: 'DELETE',
+                            headers: { 'X-CSRFToken': csrfToken }
+                        })
+                        
+                        if (res.ok) {
+                            sessions.value = sessions.value.filter(s => s.id !== id)
+                            if (currentSessionId.value === id) {
+                                currentSessionId.value = null
+                                messages.value = []
+                            }
+                        }
+                    } catch (e) {
+                        console.error("Delete session error:", e)
+                    }
+                }
+
+                const selectSession = async (session) => {
+                    if (currentSessionId.value === session.id) return
+                    
+                    currentSessionId.value = session.id
+                    isLoading.value = true
+                    messages.value = [] // clear previous messages
+                    
+                    try {
+                        const res = await fetch(`/ai/sessions/${session.id}/messages`)
+                        if (res.ok) {
+                            const history = await res.json()
+                            messages.value = history
+                            await scrollToBottom()
+                        }
+                    } catch (e) {
+                        console.error("Load history error:", e)
+                    } finally {
+                        isLoading.value = false
+                    }
+                }
+
                 const sendMessage = async () => {
-                    if (!inputMessage.value.trim() || isLoading.value) return
+                    if (!inputMessage.value.trim() || isLoading.value || !currentSessionId.value) return
 
                     const userMsg = inputMessage.value.trim()
                     messages.value.push({ role: 'user', content: userMsg })
                     inputMessage.value = ''
                     isLoading.value = true
                     
-                    // Create placeholder for AI response
-                    const aiMsgIndex = messages.value.push({ role: 'ai', content: '', streaming: true }) - 1
+                    // Placeholder for AI response
+                    const aiMsgIndex = messages.value.push({ role: 'assistant', content: '', streaming: true }) - 1
                     await scrollToBottom()
 
                     try {
-                        // Get CSRF token from meta tag
-                        const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-                        
                         const response = await fetch('/ai/chat', {
                             method: 'POST',
                             headers: { 
                                 'Content-Type': 'application/json',
                                 'X-CSRFToken': csrfToken 
                             },
-                            body: JSON.stringify({ message: userMsg })
+                            body: JSON.stringify({ 
+                                message: userMsg,
+                                session_id: currentSessionId.value
+                            })
                         })
 
                         if (!response.ok) throw new Error('Network response was not ok')
@@ -153,10 +305,8 @@
                             if (done) break
                             
                             buffer += decoder.decode(value, { stream: true })
-                            
-                            // Process NDJSON lines
                             const lines = buffer.split('\n')
-                            buffer = lines.pop() // Keep last incomplete line
+                            buffer = lines.pop()
 
                             for (const line of lines) {
                                 if (line.trim()) {
@@ -172,6 +322,9 @@
                                 }
                             }
                         }
+                        // Refresh session list to update timestamp/title
+                        fetchSessions()
+                        
                     } catch (error) {
                         messages.value[aiMsgIndex].content += '\n[出错了: ' + error.message + ']'
                     } finally {
@@ -181,16 +334,26 @@
                     }
                 }
 
+                onMounted(() => {
+                    fetchSessions()
+                })
+
                 return {
+                    sessions,
                     messages,
                     inputMessage,
                     isLoading,
-                    sendMessage,
-                    chatContainer
+                    currentSessionId,
+                    currentSessionTitle,
+                    chatContainer,
+                    formatDate,
+                    createNewSession,
+                    selectSession,
+                    deleteSession,
+                    sendMessage
                 }
             }
         }).mount('#app')
     </script>
 </body>
 </html>
-

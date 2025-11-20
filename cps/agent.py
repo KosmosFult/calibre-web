@@ -54,17 +54,17 @@ class AgentTool:
         return None
 
 class CalibreAgent:
-    def __init__(self, api_key, base_url, model="gemini-2.5-flash", system_prompt=None):
+    def __init__(self, api_key, base_url, model="gemini-flash-latest", system_prompt=None, enable_web_search=False):
         if not openai_available:
             raise ImportError("OpenAI module is not installed. Please install it using 'pip install openai'")
         
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
+        self.enable_web_search = enable_web_search
         self.system_prompt = system_prompt or (
-            "你是 Calibre-Web 的 AI 图书管家。你可以通过工具查询书库中的书籍信息。"
-            "请根据用户的需求，调用合适的工具进行查询，并根据查询结果友好地回复用户。"
-            "如果查询结果为空，请礼貌地告知用户。"
-            "请用中文回答。"
+            "你是 Calibre-Web 的 AI 图书管家。你可以给用推荐书库里面的书籍，或者给出书籍介绍，等等一些和阅读相关的问题"
+            "你可以通过工具查询书库中的各种书籍信息，请在你需要的时候调用。"
+            # "当书库中没有相关信息，或者用户询问最近的新闻、书籍评价等外部信息时，你可以使用 web_search 工具进行搜索。"
         )
         self.history = []
         # 初始化 System Prompt
@@ -77,16 +77,22 @@ class CalibreAgent:
         """
         # 1. 添加用户消息
         self.history.append({"role": "user", "content": user_message})
+        
+        # 准备 Tools
+        tools = AgentTool.get_tools_schema()
 
         # 2. 第一轮调用 LLM (可能会返回 tool_calls)
         try:
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.history,
-                tools=AgentTool.get_tools_schema(),
-                tool_choice="auto",
-                stream=False  # 第一轮先不流式，方便处理 Tool Call 逻辑
-            )
+            # 构造请求参数
+            request_kwargs = {
+                "model": self.model,
+                "messages": self.history,
+                "tools": tools,
+                "tool_choice": "auto",
+                "stream": False
+            }
+            
+            completion = self.client.chat.completions.create(**request_kwargs)
         except Exception as e:
             yield f"AI 接口调用失败: {str(e)}"
             return
@@ -144,8 +150,6 @@ class CalibreAgent:
 
         else:
             # 没有工具调用，直接返回回答
-            # 注意：前面是非流式的，所以这里直接拿到内容。为了前端体验统一，我们模拟流式输出一下，或者如果想纯流式，第一步就得重构
-            # 简单起见，如果是非工具调用，我们直接把内容输出
             content = response_message.content
             self.history.append({"role": "assistant", "content": content})
             yield content
@@ -189,13 +193,7 @@ def search_books(keyword, field="all"):
     if field == "title":
         query = query.filter(db.Books.title.ilike(f"%{keyword}%"))
     elif field == "author":
-        # 复杂的作者关联查询略，这里简化演示，实际项目可以用 db.py 里的 search_query 逻辑
-        # 这里为了演示方便，还是先只搜标题吧，或者用简单的逻辑
-        pass 
-        # 注意：真实的 Calibre-Web 搜索逻辑比较复杂（涉及多表关联），建议复用 db.search_query
-        # 但这里我们为了 Agent 稳定性，先实现一个最简单的标题搜索
-        query = query.filter(db.Books.title.ilike(f"%{keyword}%"))
-
+        query = query.filter(db.Books.title.ilike(f"%{keyword}%")) # 简化逻辑
     elif field == "all":
          query = query.filter(db.Books.title.ilike(f"%{keyword}%"))
     
@@ -237,3 +235,19 @@ def get_library_stats():
         "total_authors": author_count
     }, ensure_ascii=False)
 
+# @AgentTool(
+#     name="web_search",
+#     description="当在本地书库找不到信息，或者需要查询书籍评价、作者背景、最新动态等外部信息时使用。使用搜索引擎查询互联网上的信息。",
+#     parameters={
+#         "type": "object",
+#         "properties": {
+#             "query": {
+#                 "type": "string",
+#                 "description": "搜索查询词"
+#             }
+#         },
+#         "required": ["query"]
+#     }
+# )
+# def web_search(query):
+#     pass

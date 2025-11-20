@@ -93,6 +93,11 @@ sqlalchemy_version2 = ([int(x) if x.isnumeric() else 0 for x in sql_version.spli
 def add_security_headers(resp):
     default_src = ([host.strip() for host in config.config_trustedhosts.split(',') if host] +
                    ["'self'", "'unsafe-inline'", "'unsafe-eval'"])
+    
+    # Allow CDN for AI chat page
+    if request.path.startswith('/ai/'):
+        default_src.extend(['https://cdn.tailwindcss.com', 'https://unpkg.com'])
+
     csp = "default-src " + ' '.join(default_src)
     if request.endpoint == "web.read_book" and config.config_use_google_drive:
         csp +=" blob: "

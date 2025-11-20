@@ -224,6 +224,9 @@ def create_app():
     register_scheduled_tasks(config.schedule_reconnect)
     register_startup_tasks()
 
+    from .ai import ai
+    app.register_blueprint(ai)
+
     return app
 
 

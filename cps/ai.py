@@ -15,7 +15,7 @@ def get_agent():
     """
     获取 Agent 实例（不带历史，历史由调用方注入）
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "AIzaSyBaX5Xw-DwsotnMFq_9Q52GT8dYRLQe9iA")
+    api_key = os.environ.get("OPENAI_API_KEY", "abc123")
     base_url = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
     
     if not api_key:

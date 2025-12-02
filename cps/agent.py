@@ -1,561 +1,413 @@
 # -*- coding: utf-8 -*-
+import copy
 import json
 import logging
-import inspect
-import base64
-import os
-from functools import wraps
-from sqlalchemy.sql.expression import func
+from typing import Any, Dict, List, Optional, Tuple
 
-# 尝试导入 openai，如果用户没安装也不要报错导致程序崩溃
+from .ai_tools import AgentTool
+
 try:
-    from openai import OpenAI
-    openai_available = True
+    from google import genai
+
+    GENAI_AVAILABLE = True
 except ImportError:
-    openai_available = False
+    genai = None
+    GENAI_AVAILABLE = False
 
 log = logging.getLogger("calibre-web.ai")
 
-class AgentTool:
-    """
-    装饰器：用于将普通 Python 函数注册为 Agent 可调用的工具
-    """
-    _registry = {}
-
-    def __init__(self, name, description, parameters):
-        self.name = name
-        self.description = description
-        self.parameters = parameters
-
-    def __call__(self, func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-        
-        # 注册工具
-        AgentTool._registry[self.name] = {
-            "function": wrapper,
-            "schema": {
-                "type": "function",
-                "function": {
-                    "name": self.name,
-                    "description": self.description,
-                    "parameters": self.parameters
-                }
-            }
-        }
-        return wrapper
-
-    @classmethod
-    def get_tools_schema(cls):
-        return [item["schema"] for item in cls._registry.values()]
-
-    @classmethod
-    def get_tool_func(cls, name):
-        if name in cls._registry:
-            return cls._registry[name]["function"]
-        return None
 
 class CalibreAgent:
-    def __init__(self, api_key, base_url, model="gemini-2.5-flash", system_prompt=None, enable_web_search=False):
-        if not openai_available:
-            raise ImportError("OpenAI module is not installed. Please install it using 'pip install openai'")
-        
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
+    """
+    Google GenAI 专用 Agent，直接使用 Gemini API 的对话格式（role + parts）。
+    """
+
+    DEFAULT_MODEL = "gemini-2.0-flash"
+    MAX_TOOL_TURNS = 5
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        enable_web_search: bool = False,
+    ):
+        if not GENAI_AVAILABLE:
+            raise ImportError("Google GenAI SDK 未安装，请运行 'pip install google-genai'")
+        if not api_key:
+            raise ValueError("必须提供 Google GenAI API Key。")
+
+        client_kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["client_options"] = {"api_endpoint": base_url.rstrip("/")}
+
+        self.client = genai.Client(**client_kwargs)
+        self.model = model or self.DEFAULT_MODEL
         self.enable_web_search = enable_web_search
         self.system_prompt = system_prompt or (
-            "你是 Calibre-Web 的 AI 图书管家。你可以给用户推荐书库里面的书籍，给出书籍介绍，回答关于书籍内容的问题。"
-            "你可以通过工具查询书库中的各种书籍信息，请在你需要的时候调用。\n\n"
-            "可用工具说明：\n"
-            "- search_books: 搜索书籍（按书名、作者、标签）\n"
-            "- get_recent_books / get_random_books / get_books_by_rating: 推荐书籍\n"
-            "- get_book_cover: 获取书籍封面图片\n"
-            "- get_book_chapters: 获取书籍的章节列表（了解书籍结构）\n"
-            "- read_book_chapter: 读取书籍的具体章节内容\n\n"
-            "使用建议：\n"
-            "1. 当用户询问推荐书籍时，使用推荐类工具\n"
-            "2. 当用户询问书籍的具体内容、情节、人物时，先用 get_book_chapters 了解结构，再用 read_book_chapter 读取相关章节\n"
-            "3. 当需要了解书籍外观时，可以调用 get_book_cover\n"
-            "4. 回答时要自然流畅，不要暴露工具调用的细节"
+            "你是 Calibre-Web 的 AI 图书管家。你能够推荐书籍、概述内容、回答关于书籍的各种问题。"
+            "需要查询书库时，请主动调用提供的工具。"
         )
-        self.history = []
-        # 初始化 System Prompt
-        self.history.append({"role": "system", "content": self.system_prompt})
+        # 历史记录使用 Gemini 的标准结构：[{role: 'user'|'model', parts: [...]}, ...]
+        self.history: List[Dict[str, Any]] = []
 
-    def chat(self, user_message):
+    # ------------------------------------------------------------------ #
+    # History helpers
+    # ------------------------------------------------------------------ #
+    def extend_history(self, messages: Optional[List[Dict[str, Any]]]):
+        if not messages:
+            return
+        for msg in messages:
+            self.history.append(self._normalize_message(msg))
+
+    def build_user_message(self, text: str) -> Dict[str, Any]:
+        return {"role": "user", "parts": [{"text": text}]}
+
+    def append_message(self, message: Dict[str, Any]):
+        self.history.append(self._normalize_message(message))
+
+    # ------------------------------------------------------------------ #
+    # Main chat loop
+    # ------------------------------------------------------------------ #
+    def chat(self):
         """
-        核心对话循环：User -> LLM -> (Tool Call -> Function -> Tool Output -> LLM) -> Final Response
-        这是一个生成器，支持流式输出
+        触发 Gemini 一轮对话。调用方应在调用 chat() 之前将用户消息写入 history。
+        该方法是生成器，便于前端流式消费。
         """
-        # 1. 添加用户消息
-        self.history.append({"role": "user", "content": user_message})
-        
-        # 准备 Tools
-        tools = AgentTool.get_tools_schema()
-
-        # 设置最大循环次数，防止死循环
-        max_turns = 5
-        current_turn = 0
-
-        while current_turn < max_turns:
-            current_turn += 1
-
-            # 2. 调用 LLM (可能会返回 tool_calls)
+        turns = 0
+        while turns < self.MAX_TOOL_TURNS:
+            turns += 1
             try:
-                # 构造请求参数
-                request_kwargs = {
-                    "model": self.model,
-                    "messages": self.history,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                    "stream": False
-                }
-                
-                completion = self.client.chat.completions.create(**request_kwargs)
-            except Exception as e:
-                yield f"AI 接口调用失败: {str(e)}"
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=self._history_payload(),
+                    config=self._build_generate_config(),
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error("Gemini 调用失败: %s", exc, exc_info=True)
+                yield f"AI 接口调用失败: {exc}"
                 return
 
-            response_message = completion.choices[0].message
+            candidate = self._get_primary_candidate(response)
+            if not candidate:
+                yield getattr(response, "text", "AI 没有返回结果")
+                return
 
-            # 3. 检查是否有工具调用请求
-            tool_calls = response_message.tool_calls
-            
-            if tool_calls:
-                # 将 AI 的 Tool Call 意图加入历史
-                self.history.append(response_message)
-                
-                # 执行所有请求的工具
-                for tool_call in tool_calls:
-                    function_name = tool_call.function.name
-                    function_args = json.loads(tool_call.function.arguments)
-                    
-                    log.info(f"Agent is calling tool: {function_name} with args: {function_args}")
-                    
-                    # 查找并执行函数
-                    func = AgentTool.get_tool_func(function_name)
-                    image_data = None
+            parts = self._get_candidate_parts(candidate)
+            function_calls = self._extract_function_calls(parts)
+            assistant_text = self._collect_text(parts)
 
-                    if func:
-                        try:
-                            function_response = func(**function_args)
-                            
-                            # check for image response special format
-                            try:
-                                if isinstance(function_response, str):
-                                    resp_json = json.loads(function_response)
-                                    if isinstance(resp_json, dict) and "_image_data" in resp_json:
-                                        image_data = resp_json["_image_data"]
-                                        # remove image data from history to save context
-                                        del resp_json["_image_data"]
-                                        function_response = json.dumps(resp_json, ensure_ascii=False)
-                            except json.JSONDecodeError:
-                                pass
-
-                        except Exception as e:
-                            function_response = f"Error executing {function_name}: {str(e)}"
-                    else:
-                        function_response = f"Error: Tool {function_name} not found."
-
-                    # 将工具执行结果加入历史
-                    self.history.append({
-                        "tool_call_id": tool_call.id,
-                        "role": "tool",
-                        "name": function_name,
-                        "content": str(function_response),
-                    })
-                    
-                    # 如果有图片数据，注入一个新的 User 消息
-                    if image_data:
-                        self.history.append({
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "Here is the image requested."},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
-                            ]
-                        })
-                
-                # 关键点：这里 continue，让 while 循环继续，再次调用 LLM
-                # LLM 会看到 Tool 的结果，决定是继续调用工具，还是输出最终回答
+            if function_calls:
+                assistant_message = {"role": "model", "parts": self._parts_to_dicts(parts)}
+                self.history.append(assistant_message)
+                if assistant_text:
+                    yield assistant_text
+                self._execute_function_calls(function_calls)
                 continue
 
-            else:
-                # 没有工具调用，说明是最终回答，或者是单纯的对话
-                content = response_message.content
-                self.history.append({"role": "assistant", "content": content})
-                yield content
-                # 结束循环
-                return
+            final_text = assistant_text or getattr(candidate, "text", None) or getattr(response, "text", None)
+            if not final_text:
+                final_text = "（未返回内容）"
 
-# ==============================================================================
-# 具体工具实现 (Tools Implementation)
-# ==============================================================================
+            self.history.append({"role": "model", "parts": [{"text": final_text}]})
+            yield final_text
+            return
 
-from . import calibre_db, db, config
-from sqlalchemy import or_
+        yield "工具调用次数已达上限，无法完成请求。"
 
-def format_books(books):
-    results = []
-    for book in books:
-        # 获取作者名
-        authors = [a.name for a in book.authors]
-        tags = [t.name for t in book.tags]
-        
-        # 获取评分（兼容性处理）
-        # Books.ratings 是一个关系属性，返回 Ratings 对象列表
-        # 通常一本书只有一个评分，取第一个
-        rating = 0
-        if book.ratings and len(book.ratings) > 0:
-            # 确保取到的是数值
-            rating = book.ratings[0].rating
-            
-        results.append({
-            "id": book.id,
-            "title": book.title,
-            "authors": authors,
-            "tags": tags,
-            "rating": rating,
-            "year": book.pubdate.year if book.pubdate else "Unknown",
-            "description": book.comments[0].text[:200] + "..." if book.comments else "无简介"
-        })
-    return json.dumps(results, ensure_ascii=False)
+    # ------------------------------------------------------------------ #
+    # Request construction helpers
+    # ------------------------------------------------------------------ #
+    def _build_generate_config(self) -> Dict[str, Any]:
+        config: Dict[str, Any] = {"system_instruction": self.system_prompt}
+        tools = self._build_tools_payload()
+        if tools:
+            config["tools"] = tools
+        return config
 
-@AgentTool(
-    name="get_book_cover",
-    description="获取书籍的封面图片。当需要向用户介绍书籍外观或封面细节时调用。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "book_id": {
-                "type": "integer",
-                "description": "书籍的 ID"
-            }
-        },
-        "required": ["book_id"]
-    }
-)
-def get_book_cover(book_id):
-    session = calibre_db.session
-    book = session.query(db.Books).filter(db.Books.id == book_id).first()
-    
-    if not book:
-         return json.dumps({"status": "error", "message": "Book not found"})
-    
-    if not book.has_cover:
-         return json.dumps({"status": "error", "message": "Book has no cover"})
+    def _build_tools_payload(self) -> List[Dict[str, Any]]:
+        payload: List[Dict[str, Any]] = []
+        declarations = AgentTool.get_function_declarations()
+        if declarations:
+            payload.append({"function_declarations": declarations})
+        if self.enable_web_search:
+            payload.append({"google_search": {}})
+        return payload
 
-    try:
-        library_path = config.config_calibre_dir
-        book_path = book.path
-        # Use os.path.join to handle separators correctly
-        cover_path = os.path.join(library_path, book_path, "cover.jpg")
-        
-        if os.path.exists(cover_path):
-            with open(cover_path, "rb") as f:
-                image_data = base64.b64encode(f.read()).decode("utf-8")
-            
-            return json.dumps({
-                "status": "success",
-                "message": "Cover loaded successfully",
-                "_image_data": image_data  # special key for chat loop interception
-            })
+    def _history_payload(self) -> List[Dict[str, Any]]:
+        # 深拷贝，避免 SDK 修改内部结构
+        return json.loads(json.dumps(self.history, ensure_ascii=False))
+
+    # ------------------------------------------------------------------ #
+    # Response parsing
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _get_primary_candidate(response: Any) -> Optional[Any]:
+        candidates = getattr(response, "candidates", None)
+        if not candidates:
+            return None
+        return candidates[0]
+
+    @staticmethod
+    def _get_candidate_parts(candidate: Any) -> List[Any]:
+        if hasattr(candidate, "content") and getattr(candidate.content, "parts", None):
+            return candidate.content.parts
+        return getattr(candidate, "parts", []) or []
+
+    def _extract_function_calls(self, parts: List[Any]) -> List[Dict[str, Any]]:
+        calls: List[Dict[str, Any]] = []
+        for part in parts:
+            fc = self._function_call_from_part(part)
+            if fc:
+                calls.append(fc)
+        return calls
+
+    def _function_call_from_part(self, part: Any) -> Optional[Dict[str, Any]]:
+        function_call = None
+        if hasattr(part, "function_call"):
+            function_call = getattr(part, "function_call")
+        elif isinstance(part, dict):
+            function_call = part.get("function_call")
+
+        if not function_call:
+            return None
+
+        if hasattr(function_call, "model_dump"):
+            data = function_call.model_dump()
+        elif isinstance(function_call, dict):
+            data = function_call
         else:
-            return json.dumps({"status": "error", "message": "Cover file missing from disk"})
-            
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-@AgentTool(
-    name="search_books",
-    description="根据关键词搜索书籍。可以搜索书名、作者或标签。如果用户没有指定搜索字段，默认全搜。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "keyword": {
-                "type": "string",
-                "description": "搜索关键词，例如 '科幻', '三体', 'J.K. Rowling'"
-            },
-            "field": {
-                "type": "string",
-                "enum": ["title", "author", "tag", "all"],
-                "description": "搜索字段：title(书名), author(作者), tag(标签), all(全部)。默认为 all"
+            data = {
+                "id": getattr(function_call, "id", None),
+                "name": getattr(function_call, "name", None),
+                "args": getattr(function_call, "args", None),
             }
-        },
-        "required": ["keyword"]
-    }
-)
-def search_books(keyword, field="all"):
-    session = calibre_db.session
-    query = session.query(db.Books)
-    limit = 5
 
-    if field == "title":
-        query = query.filter(db.Books.title.ilike(f"%{keyword}%"))
-    elif field == "author":
-        query = query.join(db.books_authors_link).join(db.Authors).filter(db.Authors.name.ilike(f"%{keyword}%"))
-    elif field == "tag":
-        query = query.join(db.books_tags_link).join(db.Tags).filter(db.Tags.name.ilike(f"%{keyword}%"))
-    elif field == "all":
-        # 简化处理：只搜标题，如果需要全搜比较复杂
-        query = query.filter(db.Books.title.ilike(f"%{keyword}%"))
-    
-    books = query.limit(limit).all()
-    if not books:
-        return json.dumps({"status": "empty", "message": f"没有找到包含 '{keyword}' 的书籍。"})
-    return format_books(books)
+        if not data.get("name"):
+            return None
 
-@AgentTool(
-    name="get_library_stats",
-    description="获取图书馆的统计信息，如总书目数、作者数等。",
-    parameters={
-        "type": "object",
-        "properties": {},
-        "required": []
-    }
-)
-def get_library_stats():
-    session = calibre_db.session
-    book_count = session.query(db.Books).count()
-    author_count = session.query(db.Authors).count()
-    
-    return json.dumps({
-        "total_books": book_count,
-        "total_authors": author_count
-    }, ensure_ascii=False)
+        args = self._coerce_args_dict(data.get("args"))
+        return {
+            "id": data.get("id"),
+            "name": data.get("name"),
+            "args": args,
+        }
 
-@AgentTool(
-    name="get_recent_books",
-    description="获取最近入库的新书。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "limit": {
-                "type": "integer",
-                "description": "返回数量，默认为 5"
+    @staticmethod
+    def _get_text_from_part(part: Any) -> Optional[str]:
+        if hasattr(part, "text"):
+            return part.text
+        if isinstance(part, dict):
+            return part.get("text")
+        return None
+
+    def _collect_text(self, parts: List[Any]) -> str:
+        texts = [text for text in (self._get_text_from_part(p) for p in parts) if text]
+        return "".join(texts).strip()
+
+    # ------------------------------------------------------------------ #
+    # Tool execution
+    # ------------------------------------------------------------------ #
+    def _execute_function_calls(self, function_calls: List[Dict[str, Any]]):
+        for call in function_calls:
+            name = call.get("name")
+            args = call.get("args") or {}
+            func = AgentTool.get_tool_func(name)
+
+            if not func:
+                payload = {"status": "error", "message": f"未找到工具 {name}"}
+                image_data = None
+            else:
+                try:
+                    result = func(**args)
+                    payload, image_data = self._normalize_tool_output(result)
+                except Exception as exc:  # pylint: disable=broad-except
+                    log.exception("工具 %s 执行失败", name)
+                    payload = {"status": "error", "message": str(exc)}
+                    image_data = None
+
+            response_part = {
+                "function_response": {
+                    "name": name,
+                    "response": payload,
+                }
             }
-        },
-        "required": []
-    }
-)
-def get_recent_books(limit=5):
-    session = calibre_db.session
-    # timestamp 通常是入库时间，pubdate 是出版日期。新书推荐通常用 timestamp
-    books = session.query(db.Books).order_by(db.Books.timestamp.desc()).limit(limit).all()
-    if not books:
-        return json.dumps({"status": "empty", "message": "书库为空"})
-    return format_books(books)
+            if call.get("id"):
+                response_part["function_response"]["id"] = call["id"]
 
-@AgentTool(
-    name="get_random_books",
-    description="随机推荐几本书籍。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "limit": {
-                "type": "integer",
-                "description": "返回数量，默认为 5"
-            }
-        },
-        "required": []
-    }
-)
-def get_random_books(limit=5):
-    session = calibre_db.session
-    books = session.query(db.Books).order_by(func.random()).limit(limit).all()
-    if not books:
-        return json.dumps({"status": "empty", "message": "书库为空"})
-    return format_books(books)
+            self.history.append({"role": "user", "parts": [response_part]})
 
-@AgentTool(
-    name="get_books_by_rating",
-    description="获取评分最高的书籍。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "limit": {
-                "type": "integer",
-                "description": "返回数量，默认为 5"
-            }
-        },
-        "required": []
-    }
-)
-def get_books_by_rating(limit=5):
-    session = calibre_db.session
-    
-    # 联表查询：Books -> books_ratings_link -> Ratings
-    # 并按 Ratings.rating 排序
-    books = session.query(db.Books)\
-        .join(db.books_ratings_link)\
-        .join(db.Ratings)\
-        .order_by(db.Ratings.rating.desc(), db.Books.timestamp.desc())\
-        .limit(limit).all()
+            if image_data:
+                self._append_image_message(image_data)
 
-    if not books:
-        return json.dumps({"status": "empty", "message": "没有评分的书籍"})
-    return format_books(books)
+    def _normalize_tool_output(self, result: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+        if isinstance(result, str):
+            try:
+                payload = json.loads(result)
+            except json.JSONDecodeError:
+                payload = {"content": result}
+        elif isinstance(result, dict):
+            payload = copy.deepcopy(result)
+        elif isinstance(result, list):
+            payload = {"items": result}
+        else:
+            payload = {"content": str(result)}
 
-@AgentTool(
-    name="get_book_chapters",
-    description="获取书籍的章节列表（不含内容）。用于了解书籍结构。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "book_id": {
-                "type": "integer",
-                "description": "书籍的 ID"
-            }
-        },
-        "required": ["book_id"]
-    }
-)
-def get_book_chapters(book_id):
-    """获取书籍的章节列表"""
-    from .book_content_extractor import BookContentExtractor
-    
-    session = calibre_db.session
-    book = session.query(db.Books).filter(db.Books.id == book_id).first()
-    
-    if not book:
-        return json.dumps({"status": "error", "message": "Book not found"})
-    
-    # 找到可阅读的格式
-    readable_formats = ['epub', 'kepub', 'txt']
-    book_format = None
-    book_data = None
-    
-    for data in book.data:
-        if data.format.lower() in readable_formats:
-            book_format = data.format.lower()
-            book_data = data
-            break
-    
-    if not book_format:
-        return json.dumps({
-            "status": "error", 
-            "message": f"Book has no readable format. Available: {[d.format for d in book.data]}"
-        })
-    
-    # 获取文件路径
-    file_path = os.path.normpath(
-        os.path.join(config.config_calibre_dir, book.path, 
-                    book_data.name + "." + book_format)
-    )
-    
-    if not os.path.exists(file_path):
-        return json.dumps({"status": "error", "message": "Book file not found on disk"})
-    
-    try:
-        # 提取内容
-        content_data = BookContentExtractor.extract(file_path, book_format)
-        
-        # 只返回章节列表，不包含内容（节省 token）
-        chapters_info = [
+        image_data = None
+        if isinstance(payload, dict) and "_image_data" in payload:
+            image_data = payload.pop("_image_data")
+
+        if isinstance(payload, list):
+            payload = {"items": payload}
+        elif not isinstance(payload, dict):
+            payload = {"result": payload}
+
+        return payload, image_data
+
+    def _append_image_message(self, image_data: str):
+        self.history.append(
             {
-                "index": ch["index"],
-                "title": ch["title"],
-                "word_count": ch["word_count"]
+                "role": "user",
+                "parts": [
+                    {"text": "这里是生成的图片。"},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": image_data,
+                        }
+                    },
+                ],
             }
-            for ch in content_data["chapters"]
-        ]
-        
-        return json.dumps({
-            "status": "success",
-            "book_title": content_data["title"],
-            "total_chapters": content_data["total_chapters"],
-            "chapters": chapters_info
-        }, ensure_ascii=False)
-        
-    except Exception as e:
-        log.error(f"Failed to extract book chapters: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        )
 
-@AgentTool(
-    name="read_book_chapter",
-    description="读取书籍的指定章节内容。用于回答关于书籍具体内容的问题。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "book_id": {
-                "type": "integer",
-                "description": "书籍的 ID"
-            },
-            "chapter_index": {
-                "type": "integer",
-                "description": "章节索引（从 0 开始）。如果不指定，默认读取第一章"
-            },
-            "max_words": {
-                "type": "integer",
-                "description": "最多返回多少字，避免内容过长。默认 3000 字"
+    # ------------------------------------------------------------------ #
+    # Serialization helpers
+    # ------------------------------------------------------------------ #
+    def _parts_to_dicts(self, parts: List[Any]) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        for part in parts:
+            if hasattr(part, "text") and part.text:
+                serialized.append({"text": part.text})
+                continue
+
+            function_call = getattr(part, "function_call", None)
+            if function_call:
+                args = self._coerce_args_dict(getattr(function_call, "args", None))
+                payload = {
+                    "name": getattr(function_call, "name", None),
+                    "args": args,
+                }
+                if getattr(function_call, "id", None):
+                    payload["id"] = function_call.id
+                serialized.append({"function_call": payload})
+                continue
+
+            function_response = getattr(part, "function_response", None)
+            if function_response:
+                response = getattr(function_response, "response", {}) or {}
+                if hasattr(response, "model_dump"):
+                    response = response.model_dump()
+                payload = {
+                    "name": getattr(function_response, "name", None),
+                    "response": response,
+                }
+                if getattr(function_response, "id", None):
+                    payload["id"] = function_response.id
+                serialized.append({"function_response": payload})
+                continue
+
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data:
+                serialized.append(
+                    {
+                        "inline_data": {
+                            "mime_type": getattr(inline_data, "mime_type", "application/octet-stream"),
+                            "data": getattr(inline_data, "data", ""),
+                        }
+                    }
+                )
+                continue
+
+            file_data = getattr(part, "file_data", None)
+            if file_data:
+                serialized.append({"file_data": {"file_uri": getattr(file_data, "file_uri", None)}})
+                continue
+
+            # Fallback：直接尝试序列化
+            try:
+                serialized.append(json.loads(json.dumps(part)))
+            except TypeError:
+                serialized.append({"text": str(part)})
+
+        return serialized
+
+    def _normalize_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        role = (message or {}).get("role", "user")
+        parts = message.get("parts") if isinstance(message, dict) else None
+        if not isinstance(parts, list):
+            parts = []
+        normalized_parts = [self._normalize_part(part) for part in parts]
+        return {"role": role, "parts": normalized_parts}
+
+    def _normalize_part(self, part: Any) -> Dict[str, Any]:
+        if not isinstance(part, dict):
+            return {"text": str(part)}
+        if "text" in part:
+            return {"text": str(part["text"])}
+        if "function_call" in part:
+            fc = part["function_call"] or {}
+            return {
+                "function_call": {
+                    "name": fc.get("name"),
+                    "args": self._coerce_args_dict(fc.get("args")),
+                    **({"id": fc["id"]} if fc.get("id") else {}),
+                }
             }
-        },
-        "required": ["book_id"]
-    }
-)
-def read_book_chapter(book_id, chapter_index=0, max_words=3000):
-    """读取书籍的指定章节内容"""
-    from .book_content_extractor import BookContentExtractor
-    
-    session = calibre_db.session
-    book = session.query(db.Books).filter(db.Books.id == book_id).first()
-    
-    if not book:
-        return json.dumps({"status": "error", "message": "Book not found"})
-    
-    # 找到可阅读的格式
-    readable_formats = ['epub', 'kepub', 'txt']
-    book_format = None
-    book_data = None
-    
-    for data in book.data:
-        if data.format.lower() in readable_formats:
-            book_format = data.format.lower()
-            book_data = data
-            break
-    
-    if not book_format:
-        return json.dumps({
-            "status": "error", 
-            "message": f"Book has no readable format. Available: {[d.format for d in book.data]}"
-        })
-    
-    # 获取文件路径
-    file_path = os.path.normpath(
-        os.path.join(config.config_calibre_dir, book.path, 
-                    book_data.name + "." + book_format)
-    )
-    
-    if not os.path.exists(file_path):
-        return json.dumps({"status": "error", "message": "Book file not found on disk"})
-    
-    try:
-        # 提取内容
-        content_data = BookContentExtractor.extract(file_path, book_format)
-        
-        if chapter_index >= len(content_data["chapters"]):
-            return json.dumps({
-                "status": "error", 
-                "message": f"Chapter index {chapter_index} out of range. Total chapters: {len(content_data['chapters'])}"
-            })
-        
-        chapter = content_data["chapters"][chapter_index]
-        content = chapter["content"]
-        
-        # 截断过长的内容
-        if len(content) > max_words:
-            content = content[:max_words] + f"\n\n[... 内容过长，已截断。完整章节共 {chapter['word_count']} 字]"
-        
-        return json.dumps({
-            "status": "success",
-            "book_title": content_data["title"],
-            "chapter_index": chapter["index"],
-            "chapter_title": chapter["title"],
-            "content": content,
-            "total_word_count": chapter["word_count"],
-            "returned_words": min(len(content), max_words)
-        }, ensure_ascii=False)
-        
-    except Exception as e:
-        log.error(f"Failed to read book chapter: {e}")
-        return json.dumps({"status": "error", "message": str(e)})
+        if "function_response" in part:
+            fr = part["function_response"] or {}
+            response = fr.get("response") or {}
+            if isinstance(response, list):
+                response = {"items": response}
+            elif not isinstance(response, dict):
+                response = {"content": response}
+            payload = {
+                "name": fr.get("name"),
+                "response": response,
+            }
+            if fr.get("id"):
+                payload["id"] = fr["id"]
+            return {"function_response": payload}
+        if "inline_data" in part:
+            inline = part["inline_data"] or {}
+            return {
+                "inline_data": {
+                    "mime_type": inline.get("mime_type", "application/octet-stream"),
+                    "data": inline.get("data", ""),
+                }
+            }
+        if "file_data" in part:
+            file_data = part["file_data"] or {}
+            return {"file_data": {"file_uri": file_data.get("file_uri")}}
+        return {"text": json.dumps(part, ensure_ascii=False)}
+
+    @staticmethod
+    def _coerce_args_dict(args: Any) -> Dict[str, Any]:
+        if args is None:
+            return {}
+        if isinstance(args, dict):
+            return args
+        if hasattr(args, "model_dump"):
+            return args.model_dump()
+        if hasattr(args, "to_dict"):
+            return args.to_dict()
+        if isinstance(args, str):
+            try:
+                data = json.loads(args)
+                if isinstance(data, dict):
+                    return data
+                return {"value": data}
+            except json.JSONDecodeError:
+                return {"value": args}
+        return {"value": args}
+

@@ -6,13 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .ai_tools import AgentTool
 
-try:
-    from google import genai
+from google import genai
+from google.genai import types
 
-    GENAI_AVAILABLE = True
-except ImportError:
-    genai = None
-    GENAI_AVAILABLE = False
 
 log = logging.getLogger("calibre-web.ai")
 
@@ -22,8 +18,8 @@ class CalibreAgent:
     Google GenAI 专用 Agent，直接使用 Gemini API 的对话格式（role + parts）。
     """
 
-    DEFAULT_MODEL = "gemini-2.0-flash"
-    MAX_TOOL_TURNS = 5
+    DEFAULT_MODEL = "gemini-2.5-flash"
+    MAX_TOOL_TURNS = 8
 
     def __init__(
         self,
@@ -33,10 +29,6 @@ class CalibreAgent:
         system_prompt: Optional[str] = None,
         enable_web_search: bool = False,
     ):
-        if not GENAI_AVAILABLE:
-            raise ImportError("Google GenAI SDK 未安装，请运行 'pip install google-genai'")
-        if not api_key:
-            raise ValueError("必须提供 Google GenAI API Key。")
 
         client_kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -135,9 +127,14 @@ class CalibreAgent:
             payload.append({"google_search": {}})
         return payload
 
-    def _history_payload(self) -> List[Dict[str, Any]]:
+    def _history_payload(self) -> List[types.Content]:
         # 深拷贝，避免 SDK 修改内部结构
-        return json.loads(json.dumps(self.history, ensure_ascii=False))
+        # old_contents = json.loads(json.dumps(self.history, ensure_ascii=False))
+        contents = []
+        for message in self.history:
+            sanitized_parts = [self._strip_inline_file_path(part) for part in message["parts"]]
+            contents.append(types.Content(role=message["role"], parts=sanitized_parts))
+        return contents
 
     # ------------------------------------------------------------------ #
     # Response parsing
@@ -217,15 +214,15 @@ class CalibreAgent:
 
             if not func:
                 payload = {"status": "error", "message": f"未找到工具 {name}"}
-                image_data = None
+                image_info = None
             else:
                 try:
                     result = func(**args)
-                    payload, image_data = self._normalize_tool_output(result)
+                    payload, image_info = self._normalize_tool_output(result)
                 except Exception as exc:  # pylint: disable=broad-except
                     log.exception("工具 %s 执行失败", name)
                     payload = {"status": "error", "message": str(exc)}
-                    image_data = None
+                    image_info = None
 
             response_part = {
                 "function_response": {
@@ -238,10 +235,10 @@ class CalibreAgent:
 
             self.history.append({"role": "user", "parts": [response_part]})
 
-            if image_data:
-                self._append_image_message(image_data)
+            if image_info:
+                self._append_image_message(image_info)
 
-    def _normalize_tool_output(self, result: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+    def _normalize_tool_output(self, result: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         if isinstance(result, str):
             try:
                 payload = json.loads(result)
@@ -254,32 +251,39 @@ class CalibreAgent:
         else:
             payload = {"content": str(result)}
 
-        image_data = None
+        image_info = None
         if isinstance(payload, dict) and "_image_data" in payload:
-            image_data = payload.pop("_image_data")
+            image_info = {
+                "image_data" : payload.pop("_image_data"),
+                "image_path" : payload.pop("_image_path")
+            }
 
         if isinstance(payload, list):
             payload = {"items": payload}
         elif not isinstance(payload, dict):
             payload = {"result": payload}
 
-        return payload, image_data
+        return payload, image_info
 
-    def _append_image_message(self, image_data: str):
+
+    # gemini的图像理解必须追加新的消息，不能直接保存到function response里
+    def _append_image_message(self, image_info):
         self.history.append(
             {
                 "role": "user",
                 "parts": [
-                    {"text": "这里是生成的图片。"},
+                    {"text": "这是获取到的图片。"},
                     {
                         "inline_data": {
                             "mime_type": "image/jpeg",
-                            "data": image_data,
+                            "data": image_info["image_data"],
+                            "file_path": image_info["image_path"],
                         }
                     },
                 ],
             }
         )
+
 
     # ------------------------------------------------------------------ #
     # Serialization helpers
@@ -410,4 +414,21 @@ class CalibreAgent:
             except json.JSONDecodeError:
                 return {"value": args}
         return {"value": args}
+
+    def _strip_inline_file_path(self, obj: Any) -> Any:
+        """
+        Remove file_path fields from inline_data before sending to Gemini SDK.
+        """
+        if isinstance(obj, dict):
+            cleaned: Dict[str, Any] = {}
+            for key, value in obj.items():
+                if key == "inline_data" and isinstance(value, dict):
+                    inline_copy = {k: self._strip_inline_file_path(v) for k, v in value.items() if k != "file_path"}
+                    cleaned[key] = inline_copy
+                else:
+                    cleaned[key] = self._strip_inline_file_path(value)
+            return cleaned
+        if isinstance(obj, list):
+            return [self._strip_inline_file_path(item) for item in obj]
+        return obj
 

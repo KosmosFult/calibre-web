@@ -78,6 +78,7 @@ def get_book_cover(book_id: int):
                     "status": "success",
                     "message": "Cover loaded successfully",
                     "_image_data": image_data,
+                    "_image_path": cover_path,
                 }
             )
         else:

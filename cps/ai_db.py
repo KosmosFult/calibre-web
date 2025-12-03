@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
+import base64
+import copy
 import datetime
 import json
+import logging
 import os
 from typing import Any, Dict, List
 
@@ -16,6 +19,8 @@ Base = declarative_base()
 engine = create_engine(DB_URI, echo=False)
 session_factory = sessionmaker(bind=engine)
 Session = scoped_session(session_factory)
+
+log = logging.getLogger("calibre-web.ai")
 
 
 class AIChat(Base):
@@ -51,7 +56,7 @@ class AIMessage(Base):
     def as_content(self) -> Dict[str, Any]:
         return {
             "role": self.role,
-            "parts": json.loads(self.parts),
+            "parts": deserialize_parts(self.parts),
         }
 
     def visible_text(self) -> str:
@@ -75,7 +80,9 @@ def get_session():
 
 
 def serialize_parts(parts: List[Dict[str, Any]]) -> str:
-    return json.dumps(parts, ensure_ascii=False)
+    safe_parts = copy.deepcopy(parts)
+    safe_parts = _strip_inline_data(safe_parts)
+    return json.dumps(safe_parts, ensure_ascii=False)
 
 
 def deserialize_parts(parts_json: str) -> List[Dict[str, Any]]:
@@ -83,11 +90,58 @@ def deserialize_parts(parts_json: str) -> List[Dict[str, Any]]:
         return []
     try:
         data = json.loads(parts_json)
+        data = _restore_inline_data(data)
         if isinstance(data, list):
             return data
         return [data]
     except json.JSONDecodeError:
         return []
+
+
+def _strip_inline_data(obj: Any) -> Any:
+    """
+    Remove inline image payloads when a file path exists so we only persist paths in DB.
+    """
+    if isinstance(obj, dict):
+        cleaned: Dict[str, Any] = {}
+        for key, value in obj.items():
+            if key == "inline_data" and isinstance(value, dict):
+                inline_copy = _strip_inline_data(value)
+                if inline_copy.get("file_path"):
+                    inline_copy.pop("data", None)
+                cleaned[key] = inline_copy
+            else:
+                cleaned[key] = _strip_inline_data(value)
+        return cleaned
+    if isinstance(obj, list):
+        return [_strip_inline_data(item) for item in obj]
+    return obj
+
+
+def _restore_inline_data(obj: Any) -> Any:
+    """
+    On load, hydrate inline images by reading them from disk using stored paths.
+    """
+    if isinstance(obj, dict):
+        restored: Dict[str, Any] = {}
+        for key, value in obj.items():
+            if key == "inline_data" and isinstance(value, dict):
+                restored_inline = dict(value)
+                file_path = restored_inline.get("file_path")
+                needs_data = file_path and not restored_inline.get("data")
+                if needs_data:
+                    try:
+                        with open(file_path, "rb") as image_file:
+                            restored_inline["data"] = base64.b64encode(image_file.read()).decode("utf-8")
+                    except OSError as exc:
+                        log.warning("无法读取图片文件 %s: %s", file_path, exc)
+                restored[key] = restored_inline
+            else:
+                restored[key] = _restore_inline_data(value)
+        return restored
+    if isinstance(obj, list):
+        return [_restore_inline_data(item) for item in obj]
+    return obj
 
 
 def history_for_chat(db_sess, chat_id: int) -> List[Dict[str, Any]]:

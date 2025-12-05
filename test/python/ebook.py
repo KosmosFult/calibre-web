@@ -1,9 +1,15 @@
+import os
 import ebooklib
+import lancedb
+
 from ebooklib import epub
 from bs4 import BeautifulSoup
-import os
 from google import genai
-import lancedb
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from cps.ai_search.context_fuse import ContextFuser
+
+from cps.ai_search.chunking import BookParser
 
 GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
 
@@ -31,22 +37,11 @@ title, chapters = read_epub('/Users/kosmosfult/Documents/calibre/[Ri ] Xie Zhen 
 db = lancedb.connect("./ebook_test")
 
 client = genai.Client()
+fuser = ContextFuser()
+
+book_parser = BookParser()
+
+# chunks = book_parser.chunk_book(17, "/Users/kosmosfult/Documents/calibre/[Ri ] Xie Zhen Zhong Xian/E Nu De Gao Bai (17)/E Nu De Gao Bai - [Ri ] Xie Zhen Zhong Xian.epub")
 
 
-
-# result = client.models.embed_content(
-#         model="gemini-embedding-001",
-#         contents= chapters[0:4])
-
-total_tokens = client.models.count_tokens(
-    model="gemini-embedding-001", contents=chapters[0]
-)
-
-print(total_tokens)
-
-model_info = client.models.get(model="gemini-embedding-001")
-
-print(f"{model_info.input_token_limit=}")
-
-# for embedding in result.embeddings:
-#     print(embedding)
+# print(len(chunks))

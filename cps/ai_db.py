@@ -5,11 +5,14 @@ import datetime
 import json
 import logging
 import os
+import enum
+import uuid
 from typing import Any, Dict, List
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, BLOB, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, scoped_session, sessionmaker
+from sqlalchemy import Enum as SQLEnum
 
 # AI 专用数据库文件
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "ai.db")
@@ -21,6 +24,64 @@ session_factory = sessionmaker(bind=engine)
 Session = scoped_session(session_factory)
 
 log = logging.getLogger("calibre-web.ai")
+
+
+
+class TaskStatus(enum.Enum):
+    READY_FOR_CONTEXT = "READY_FOR_CONTEXT"
+    CONTEXT_BATCH_SENT = "CONTEXT_BATCH_SENT"
+    READY_FOR_EMBED = "READY_FOR_EMBED"
+    EMBED_BATCH_SENT = "EMBED_BATCH_SENT"
+    DONE = "DONE"
+
+
+class BookChunk(Base):
+    __tablename__ = "ai_book_chunks"
+
+    id = Column(Integer, primary_key=True)
+    chunk_id = Column(String(64), unique=True, nullable=False, default=lambda: uuid.uuid4().hex)
+    book_id = Column(Integer, nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    chunk_hash = Column(String(64), unique=True, nullable=False)
+    text = Column(Text, nullable=False)
+    word_count = Column(Integer, default=0)
+    char_count = Column(Integer, default=0)
+    chapter_id = Column(String(255))
+    chapter_index = Column(Integer)
+    chapter_title = Column(String(255))
+    previous_chunk_id = Column(String(64))
+    next_chunk_id = Column(String(64))
+    context_window = Column(Text)
+    enriched_context = Column(Text)
+    final_vector = Column(BLOB)
+    created_at = Column(
+        DateTime,
+        default=datetime.datetime.now(datetime.timezone.utc),
+    )
+    updated_at = Column(
+        DateTime,
+        default=datetime.datetime.now(datetime.timezone.utc),
+        onupdate=datetime.datetime.now(datetime.timezone.utc),
+    )
+
+    rag_task = relationship("RAGPipelineTask", back_populates="chunk", uselist=False)
+
+    __table_args__ = (UniqueConstraint("book_id", "chunk_index", name="uq_book_chunk_position"),)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "book_id": self.book_id,
+            "chunk_index": self.chunk_index,
+            "chapter_index": self.chapter_index,
+            "chapter_title": self.chapter_title,
+            "previous_chunk_id": self.previous_chunk_id,
+            "next_chunk_id": self.next_chunk_id,
+            "word_count": self.word_count,
+            "char_count": self.char_count,
+            "has_vector": self.final_vector is not None,
+        }
+
 
 
 class AIChat(Base):
@@ -69,6 +130,55 @@ class AIMessage(Base):
             if isinstance(part, dict) and part.get("text"):
                 return part["text"]
         return ""
+
+# CREATE TABLE rag_pipeline_tasks (
+#     id INTEGER PRIMARY KEY AUTOINCREMENT,
+#     book_id INTEGER NOT NULL,
+#     chunk_hash TEXT UNIQUE,
+    
+#     -- 数据区
+#     original_text TEXT,              -- 原始切片
+#     context_window TEXT,             -- 周围章节 (用于生成)
+#     enriched_context TEXT,           -- Phase 1 结果: AI生成的上下文
+#     final_vector BLOB,               -- Phase 2 结果: 向量 (可选存这里，或直接进LanceDB)
+    
+#     -- 核心状态机
+#     status TEXT DEFAULT 'READY_FOR_CONTEXT',
+#     -- 状态流转:
+#     -- 1. READY_FOR_CONTEXT      (初始状态)
+#     -- 2. CONTEXT_BATCH_SENT     (已提交生成任务)
+#     -- 3. READY_FOR_EMBED        (生成完毕，待嵌入)
+#     -- 4. EMBED_BATCH_SENT       (已提交嵌入任务)
+#     -- 5. DONE                   (全部完成)
+
+#     -- 批次追踪 (关键!)
+#     context_batch_id TEXT,           -- 关联的生成任务ID (Google batch_xxx)
+#     embed_batch_id TEXT,             -- 关联的嵌入任务ID (Google batch_yyy)
+    
+#     created_at TIMESTAMP,
+#     updated_at TIMESTAMP
+# );
+
+# -- 索引：调度器频繁查询的状态
+# CREATE INDEX idx_status ON rag_pipeline_tasks(status);
+# CREATE INDEX idx_ctx_batch ON rag_pipeline_tasks(context_batch_id);
+# CREATE INDEX idx_emb_batch ON rag_pipeline_tasks(embed_batch_id);
+
+class RAGPipelineTask(Base):
+    __tablename__ = "rag_pipeline_tasks"
+
+    id = Column(Integer, primary_key=True)
+    chunk_id = Column(String(64), ForeignKey("ai_book_chunks.chunk_id"), unique=True, nullable=False)
+    status = Column(SQLEnum(TaskStatus), default=TaskStatus.READY_FOR_CONTEXT)
+    context_batch_id = Column(String(255))
+    embed_batch_id = Column(String(255))
+
+    created_at = Column(DateTime, default=datetime.datetime.now(datetime.timezone.utc))
+    updated_at = Column(DateTime, 
+                        default=datetime.datetime.now(datetime.timezone.utc), 
+                        onupdate=datetime.datetime.now(datetime.timezone.utc))
+
+    chunk = relationship("BookChunk", back_populates="rag_task")
 
 
 def init_db():

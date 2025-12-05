@@ -1,12 +1,9 @@
 from google import genai
 import os
 
-GEMINI_API_KEY = os.environ['GEMINI_API_KEY']
-
-
 class GeminiEmbedding:
     def __init__(self):
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
+        self.client = genai.Client()
 
     def embed(self, text : list[str] | str):
         result = self.client.models.embed_content(
@@ -15,3 +12,6 @@ class GeminiEmbedding:
         )
 
         return result.embeddings
+
+    def batch_embed(self, text : list[str] | str):
+        pass

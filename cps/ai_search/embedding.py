@@ -8,7 +8,8 @@ class GeminiEmbedding:
     def embed(self, text : list[str] | str):
         result = self.client.models.embed_content(
             model="gemini-embedding-001",
-            contents = text
+            contents = text,
+            
         )
 
         return result.embeddings

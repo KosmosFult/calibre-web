@@ -1,6 +1,9 @@
 import os
+from http.client import responses
+
 import ebooklib
 import lancedb
+from click import prompt
 
 from ebooklib import epub
 from bs4 import BeautifulSoup
@@ -34,14 +37,22 @@ def read_epub(path):
 title, chapters = read_epub('/Users/kosmosfult/Documents/calibre/[Ri ] Xie Zhen Zhong Xian/E Nu De Gao Bai (17)/E Nu De Gao Bai - [Ri ] Xie Zhen Zhong Xian.epub')
 
 
-db = lancedb.connect("./ebook_test")
+# db = lancedb.connect("./ebook_test")
+
+prompt = "".join(chapters)
 
 client = genai.Client()
-fuser = ContextFuser()
 
-book_parser = BookParser()
+res = client.models.generate_content(
+    model="gemini-flash-latest",
+    contents="我正在为电子书平台撰写书籍介绍摘要，你阅读全文，来帮我写一下，要求能够吸引读者，并且不要剧透" + "<book>" + prompt + "</book>",
+)
+
+# fuser = ContextFuser()
+#
+# book_parser = BookParser()
 
 # chunks = book_parser.chunk_book(17, "/Users/kosmosfult/Documents/calibre/[Ri ] Xie Zhen Zhong Xian/E Nu De Gao Bai (17)/E Nu De Gao Bai - [Ri ] Xie Zhen Zhong Xian.epub")
 
 
-# print(len(chunks))
+print(res.text)

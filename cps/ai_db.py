@@ -7,7 +7,7 @@ import logging
 import os
 import enum
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, BLOB, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
@@ -110,15 +110,21 @@ class AIMessage(Base):
     chat_id = Column(Integer, ForeignKey("ai_chats.id"), nullable=False)
     role = Column(String(20), nullable=False)  # user / model
     parts = Column(Text, nullable=False)  # JSON encoded list of parts
+    thought_signature = Column(BLOB)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     chat = relationship("AIChat", back_populates="messages")
 
     def as_content(self) -> Dict[str, Any]:
-        return {
+        parts = deserialize_parts(self.parts)
+        content = {
             "role": self.role,
-            "parts": deserialize_parts(self.parts),
+            "parts": parts,
         }
+        signatures = deserialize_thought_signatures(self.thought_signature, len(parts))
+        if any(signature is not None for signature in signatures):
+            content["thought_signatures"] = signatures
+        return content
 
     def visible_text(self) -> str:
         try:
@@ -208,6 +214,59 @@ def deserialize_parts(parts_json: str) -> List[Dict[str, Any]]:
         return []
 
 
+def serialize_thought_signatures(
+    signatures: Optional[List[Optional[bytes]]],
+) -> Optional[bytes]:
+    if not signatures:
+        return None
+    encoded: List[Optional[str]] = []
+    has_data = False
+    for signature in signatures:
+        if signature:
+            encoded.append(base64.b64encode(signature).decode("ascii"))
+            has_data = True
+        else:
+            encoded.append(None)
+    if not has_data:
+        return None
+    payload = json.dumps(encoded, ensure_ascii=False)
+    return payload.encode("utf-8")
+
+
+def deserialize_thought_signatures(
+    blob: Optional[bytes], expected_len: Optional[int] = None
+) -> List[Optional[bytes]]:
+    if not blob:
+        return [None] * expected_len if expected_len else []
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        fallback = [bytes(blob)]
+        if expected_len:
+            if len(fallback) < expected_len:
+                fallback.extend([None] * (expected_len - len(fallback)))
+            else:
+                fallback = fallback[:expected_len]
+        return fallback
+    if not isinstance(data, list):
+        return [None] * expected_len if expected_len else []
+    decoded: List[Optional[bytes]] = []
+    for entry in data:
+        if entry is None:
+            decoded.append(None)
+            continue
+        try:
+            decoded.append(base64.b64decode(entry))
+        except (ValueError, TypeError):
+            decoded.append(None)
+    if expected_len is not None:
+        if len(decoded) < expected_len:
+            decoded.extend([None] * (expected_len - len(decoded)))
+        else:
+            decoded = decoded[:expected_len]
+    return decoded
+
+
 def _strip_inline_data(obj: Any) -> Any:
     """
     Remove inline image payloads when a file path exists so we only persist paths in DB.
@@ -264,8 +323,18 @@ def history_for_chat(db_sess, chat_id: int) -> List[Dict[str, Any]]:
     return [m.as_content() for m in messages]
 
 
-def create_message(chat_id: int, role: str, parts: List[Dict[str, Any]]) -> AIMessage:
-    return AIMessage(chat_id=chat_id, role=role, parts=serialize_parts(parts))
+def create_message(
+    chat_id: int,
+    role: str,
+    parts: List[Dict[str, Any]],
+    thought_signatures: Optional[List[Optional[bytes]]] = None,
+) -> AIMessage:
+    return AIMessage(
+        chat_id=chat_id,
+        role=role,
+        parts=serialize_parts(parts),
+        thought_signature=serialize_thought_signatures(thought_signatures),
+    )
 
 
 def message_to_public_dict(message: AIMessage) -> Dict[str, Any]:

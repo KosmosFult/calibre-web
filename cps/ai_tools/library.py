@@ -89,8 +89,8 @@ def get_book_cover(book_id: int):
 
 
 @AgentTool(
-    name="search_books",
-    description="根据关键词搜索书籍。可以搜索书名、作者或标签。如果用户没有指定搜索字段，默认全搜。",
+    name="find_books",
+    description="根据关键词在图书馆本地查找书籍。可以搜索书名、作者或标签。如果用户没有指定搜索字段，默认全搜。",
     parameters={
         "type": "object",
         "properties": {
@@ -109,7 +109,7 @@ def get_book_cover(book_id: int):
 )
 def search_books(keyword: str, field: str = "all"):
     """
-    根据关键词搜索书籍。可以搜索书名、作者或标签。如果用户没有指定搜索字段，默认全搜。
+    根据关键词在图书馆本地查找书籍。可以搜索书名、作者或标签。如果用户没有指定搜索字段，默认全搜。
 
     Args:
         keyword: 搜索关键词，例如 '科幻', '三体', 'J.K. Rowling'

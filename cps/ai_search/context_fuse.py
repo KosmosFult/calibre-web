@@ -1,31 +1,61 @@
-import os
+import logging
+from typing import List, Sequence, Tuple
+
 from google import genai
-from typing import Any
+
+
+log = logging.getLogger(__name__)
+
+
+DocChunkPair = Tuple[str, str]
 
 
 class ContextFuser:
-    def __init__(self):
-        self.client = genai.Client()
+    def __init__(self, client: genai.Client | None = None, model: str = "gemini-2.5-flash"):
+        self.client = client or genai.Client()
+        self.model = model
 
-    def fuse(self, doc_and_chunks : list[list[Any]]):
-        fused_contexts = []
-        for doc, chunks in doc_and_chunks:
-            for chunk in chunks:
-                context = self._assemble_context(doc, chunk)
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[context]
-                )
+    def fuse(self, doc_chunk_pairs: Sequence[DocChunkPair]) -> List[str]:
+        """
+        Generate enriched context strings for each (document, chunk) pair.
+        """
+        return [self._generate(doc, chunk) for doc, chunk in doc_chunk_pairs]
 
-                fused_contexts.append(response.text)
+    def batch_fuse(
+        self,
+        doc_chunk_pairs: Sequence[DocChunkPair],
+        batch_size: int = 8,
+        raise_on_error: bool = False,
+    ) -> List[str]:
+        """
+        Fuse contexts in small batches to avoid overwhelming the API while allowing callers
+        to resume when individual generations fail.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
 
-        return fused_contexts
+        fused: List[str] = []
+        for start in range(0, len(doc_chunk_pairs), batch_size):
+            batch = doc_chunk_pairs[start : start + batch_size]
+            for doc, chunk in batch:
+                try:
+                    fused.append(self._generate(doc, chunk))
+                except Exception as exc:  # pragma: no cover - depends on network failures
+                    log.warning("Context fusion failed: %s", exc)
+                    if raise_on_error:
+                        raise
+                    fused.append("")
+        return fused
 
-    def batch_fuse(self, doc_and_chunks : list[list[Any]]):
-        pass
+    def _generate(self, doc: str, chunk: str) -> str:
+        context = self._assemble_context(doc, chunk)
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=[context],
+        )
+        return (response.text or "").strip()
 
-
-    def _assemble_context(self, doc, chunk):
+    def _assemble_context(self, doc: str, chunk: str) -> str:
         prompt = f"""# Role
                 你是一个专精于长篇小说 RAG（检索增强生成）系统的语境处理专家。
 

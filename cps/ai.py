@@ -165,7 +165,14 @@ def chat():
             # 3. 记录用户消息
             user_record = agent.build_user_message(user_message)
             agent.append_message(user_record)
-            db_sess.add(ai_db.create_message(session_id, user_record["role"], user_record["parts"]))
+            db_sess.add(
+                ai_db.create_message(
+                    session_id,
+                    user_record["role"],
+                    user_record["parts"],
+                    user_record.get("thought_signatures"),
+                )
+            )
 
             # 更新会话标题和时间
             chat_session.updated_at = datetime.datetime.utcnow()
@@ -186,7 +193,14 @@ def chat():
             new_messages = agent.history[history_checkpoint:]
 
             for msg in new_messages:
-                db_sess.add(ai_db.create_message(session_id, msg["role"], msg["parts"]))
+                db_sess.add(
+                    ai_db.create_message(
+                        session_id,
+                        msg["role"],
+                        msg["parts"],
+                        msg.get("thought_signatures"),
+                    )
+                )
 
             chat_session.updated_at = datetime.datetime.utcnow()
             db_sess.commit()

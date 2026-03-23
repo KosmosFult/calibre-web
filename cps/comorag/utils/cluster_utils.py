@@ -8,8 +8,9 @@ from sklearn.mixture import GaussianMixture
 from copy import deepcopy
 import pickle
 from tqdm import tqdm
+import time
 
-from .summarization_utils import (BaseSummarizationModel, GPT4SummarizationModel)
+from .summarization_utils import (BaseSummarizationModel, CommSummarizationModel)
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +82,12 @@ class ChunkSoftClustering:
 
         # Summary model
         if summarization_length is None:
-            summarization_length = 100
+            summarization_length = 5000
         self.summarization_length = summarization_length
 
         if summarization_model is None:
             # Create summarization_model using passed configuration parameters
-            summarization_model = GPT4SummarizationModel(
+            summarization_model = CommSummarizationModel(
                 model=llm_model_name,
                 llm_base_url=llm_base_url,
                 llm_api_key=llm_api_key
@@ -220,6 +221,7 @@ class ChunkSoftClustering:
         Returns:
             Clustering results, each cluster contains its members and membership scores
         """
+        overall_start = time.perf_counter()
         if hash_ids is None or len(hash_ids) == 0:
             hash_ids = self.embedding_store.get_all_ids()
         
@@ -233,7 +235,9 @@ class ChunkSoftClustering:
             return self.clusters
         
         # Get embeddings
+        load_embeddings_start = time.perf_counter()
         embeddings = np.array(self.embedding_store.get_embeddings(hash_ids))
+        load_embeddings_elapsed = time.perf_counter() - load_embeddings_start
         
         # Level 1: Global clustering
         
@@ -248,6 +252,7 @@ class ChunkSoftClustering:
             reduced_embeddings_global = embeddings
         
         # Global clustering
+        global_cluster_start = time.perf_counter()
         n_global_clusters = self._get_optimal_clusters(reduced_embeddings_global)
         global_gmm = GaussianMixture(
             n_components=n_global_clusters,
@@ -255,6 +260,7 @@ class ChunkSoftClustering:
             covariance_type='full'
         )
         global_gmm.fit(reduced_embeddings_global)
+        global_cluster_elapsed = time.perf_counter() - global_cluster_start
         
         # Get global membership scores
         global_membership_scores = global_gmm.predict_proba(reduced_embeddings_global)
@@ -275,6 +281,7 @@ class ChunkSoftClustering:
         total_clusters = 0
         
         # Level 2: Local clustering for each global cluster
+        local_cluster_start = time.perf_counter()
         for i in range(n_global_clusters):
             # Get indices of points belonging to current global cluster
             global_cluster_indices = np.array([j for j, gc in enumerate(global_clusters) if i in gc])
@@ -343,6 +350,7 @@ class ChunkSoftClustering:
                     self.clusters.append(local_cluster)
                 
                 total_clusters += 1
+        local_cluster_elapsed = time.perf_counter() - local_cluster_start
         
         if self.verbose:
             logger.info(f"Total cluster count: {total_clusters}")
@@ -353,6 +361,19 @@ class ChunkSoftClustering:
         if self.db_filename:
             pass
             # self._save_clustering_results()
+
+        total_elapsed = time.perf_counter() - overall_start
+        logger.info(
+            "Soft clustering timing | total=%.3fs, load_embeddings=%.3fs, global=%.3fs, local=%.3fs, "
+            "chunks=%d, global_clusters=%d, final_clusters=%d",
+            total_elapsed,
+            load_embeddings_elapsed,
+            global_cluster_elapsed,
+            local_cluster_elapsed,
+            len(hash_ids),
+            n_global_clusters,
+            len(self.clusters),
+        )
         
         return self.clusters
 
@@ -564,7 +585,19 @@ class ChunkSoftClustering:
         combined_text = ""
         for text in sorted_texts:
             combined_text += f"{' '.join(text.splitlines())}\n\n"
-            
+
+        # Algorithm rule:
+        # Build summarization instruction at call site, then pass the full prompt
+        # to summarization_model.summarize(). This keeps prompt semantics explicit
+        # and consistent with TimelineSummarizer, and avoids nested prompt wrapping.
+        prompt = (
+            "请基于以下文本片段生成一个主题摘要，要求：\n"
+            "1) 提炼共同主题与关键事实；\n"
+            "2) 保留关键实体与关系；\n"
+            "3) 使用简洁、连贯的中文表达。\n\n"
+            f"{combined_text}"
+        )
+
         # Generate summary
-        summary = self.summarization_model.summarize(combined_text, self.summarization_length)
+        summary = self.summarization_model.summarize(prompt, self.summarization_length)
         return summary

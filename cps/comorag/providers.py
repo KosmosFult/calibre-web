@@ -42,6 +42,15 @@ class ChatResult:
     finish_reason: Optional[str] = None
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class ProviderClient:
     """
     Unified provider client for OpenAI-compatible and Google GenAI APIs.
@@ -184,8 +193,8 @@ class ProviderClient:
         usage = getattr(response, "usage", None)
         return ChatResult(
             text=text,
-            prompt_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
-            completion_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            prompt_tokens=_safe_int(getattr(usage, "prompt_tokens", 0)) if usage else 0,
+            completion_tokens=_safe_int(getattr(usage, "completion_tokens", 0)) if usage else 0,
             finish_reason=getattr(response.choices[0], "finish_reason", None),
         )
 
@@ -240,7 +249,7 @@ class ProviderClient:
         usage = getattr(response, "usage_metadata", None)
         return ChatResult(
             text=getattr(response, "text", "") or "",
-            prompt_tokens=getattr(usage, "prompt_token_count", 0) if usage else 0,
-            completion_tokens=getattr(usage, "candidates_token_count", 0) if usage else 0,
+            prompt_tokens=_safe_int(getattr(usage, "prompt_token_count", 0)) if usage else 0,
+            completion_tokens=_safe_int(getattr(usage, "candidates_token_count", 0)) if usage else 0,
             finish_reason=None,
         )

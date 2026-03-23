@@ -2,24 +2,80 @@ import os
 import sys
 from pathlib import Path
 
+import ebooklib
+from bs4 import BeautifulSoup
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cps.comorag import ComoRAG
+from cps.book_content_extractor import BookContentExtractor
+from ebooklib import epub
+from cps.ai_search.chunking import BookParser
+from cps.ai_db import get_session, BookChunk
+
+
+def read_epub(path):
+    book = epub.read_epub(path)
+    chapters = []
+
+    # 获取书名等元数据
+    title = book.get_metadata('DC', 'title')[0][0]
+
+    for item in book.get_items():
+        # 只要文档类型的章节
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
+            soup = BeautifulSoup(item.get_content(), 'html.parser')
+            text = soup.get_text()
+            # 简单的过滤，去掉太短的章节（如目录页）
+            if len(text) > 500:
+                chapters.append(text)
+    return title, chapters
 
 
 def build_smoke_docs():
-    # 按“顺序 chunk”组织的最小示例文本
-    return [
-        "第一天夜里，侦探林泽来到雾港旅店，发现馆主对失踪事件三缄其口。",
-        "第二天清晨，旅店后院出现带泥脚印，脚印从仓库通向海边的小码头。",
-        "第三天傍晚，林泽在码头仓库里找到带血的袖扣，并确认它属于失踪者周迟。",
-    ]
+    """
+    Use BookParser chunking logic without requiring Flask app context.
+    We parse EPUB directly, then call parser internals to split into chunks.
+    """
+    # epub_path = "/Users/kosmosfult/Documents/books/世界树之棺 - 筒城灯士郎.epub"
+    epub_path = "/Users/kosmosfult/Documents/books/永劫馆超连续杀人事件魔女决定与X赴死 ([日]南海游,译者李影恒) (z-library.sk, 1lib.sk, z-lib.sk).epub"
+
+    parser = BookParser(chunk_size=800, chunk_overlap=200, enable_contextual=False)
+    book = epub.read_epub(epub_path)
+    chapter_docs = parser._extract_chapters(book)[:9]
+    chunks = parser._chunk_chapters(book_id=99, chapters=chapter_docs)
+    return [chunk.text for chunk in chunks]
+
+
+# def build_smoke_docs_with_app_context(book_id: int = 13):
+#     """
+#     Alternative path: if you need `chunk_book(book_id)` (Calibre path resolution + DB persist),
+#     run it under Flask app context and then read chunk text from ai.db.
+#     """
+#     from cps import create_app
+#
+#     app = create_app()
+#     parser = BookParser(chunk_size=800, chunk_overlap=200, enable_contextual=False)
+#     with app.app_context():
+#         parser.chunk_book(book_id)
+#
+#     sess = get_session()
+#     try:
+#         rows = (
+#             sess.query(BookChunk)
+#             .filter(BookChunk.book_id == book_id)
+#             .order_by(BookChunk.chunk_index.asc())
+#             .all()
+#         )
+#         return [row.text for row in rows]
+#     finally:
+#         sess.close()
 
 
 def build_query():
-    return "侦探目前掌握了哪些关键线索？"
+    return "第二次轮回是怎么发生的"
 
 
 def run_smoke_test():
@@ -42,6 +98,8 @@ def run_smoke_test():
     llm_model = os.environ.get("COMORAG_LLM_MODEL", "gemini-3.1-flash-lite-preview")
     embedding_model = os.environ.get("COMORAG_EMBEDDING_MODEL", "gemini-embedding-2-preview")
 
+    docs = build_smoke_docs()
+
     rag = ComoRAG(
         llm_model_name=llm_model,
         llm_base_url=base_url,
@@ -51,12 +109,11 @@ def run_smoke_test():
         embedding_api_key=api_key,
     )
     # 先保持 need_cluster=False 的轻量路径，验证主链路可用
-    rag.global_config.need_cluster = False
+    rag.global_config.need_cluster = True
     rag.global_config.openie_mode = "online"
     rag.global_config.llm_provider = "google_genai"
     rag.global_config.embedding_provider = "google_genai"
 
-    docs = build_smoke_docs()
     rag.index(docs)
 
     results = rag.try_answer([build_query()])

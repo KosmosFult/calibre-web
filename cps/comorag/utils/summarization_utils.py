@@ -14,7 +14,7 @@ class BaseSummarizationModel(ABC):
         pass
 
 
-class GPT4SummarizationModel(BaseSummarizationModel):
+class CommSummarizationModel(BaseSummarizationModel):
     def __init__(self, model=None, llm_base_url="https://api.example.com/v1",llm_api_key="your-api-key-here"):
         """
         Initialize class with support for custom model and API base URL.
@@ -33,9 +33,13 @@ class GPT4SummarizationModel(BaseSummarizationModel):
         )
 
     @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
-    def summarize(self, context, max_completion_tokens=500, stop_sequence=None):
+    def summarize(self, context, max_completion_tokens=5000, stop_sequence=None):
         """
-        Generate text summary using GPT-4o-mini model
+        Generate text from a pre-built summarization prompt.
+
+        Note: call sites are responsible for assembling task-specific prompt content.
+        This avoids double-wrapping instructions when upstream already provides
+        structured summarization guidance.
 
         :param context: Text that needs to be summarized
         :param max_tokens: Maximum number of summary tokens
@@ -46,10 +50,10 @@ class GPT4SummarizationModel(BaseSummarizationModel):
             result = self.provider_client.chat_completion(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "system", "content": "你是一位阅读专家，能快速准确的理解书籍内容."},
                     {
                         "role": "user",
-                        "content": f"Write a summary of the following, including as many key details as possible: {context}",
+                        "content": context,
                     },
                 ],
                 max_tokens=max_completion_tokens,
@@ -62,4 +66,3 @@ class GPT4SummarizationModel(BaseSummarizationModel):
         except Exception as e:
             print(f"An error occurred: {e}")
             return str(e)
-        

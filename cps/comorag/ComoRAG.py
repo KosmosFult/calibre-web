@@ -16,10 +16,9 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tiktoken
 
-from .utils.embed_utils import get_similar_summaries
 from .utils import agents
 from .utils.timeline_utils import TimelineSummarizer
-from .utils.summarization_utils import GPT4SummarizationModel
+from .utils.summarization_utils import CommSummarizationModel
 
 from .llm import _get_llm_class, BaseLLM
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
@@ -47,6 +46,7 @@ class ComoRAG:
                  embedding_model_name=None,
                  embedding_base_url=None,
                  embedding_api_key=None,
+                 book_id=None
                  ):
         if global_config is None:
             self.global_config = BaseConfig()
@@ -66,6 +66,9 @@ class ComoRAG:
             self.global_config.embedding_api_key = embedding_api_key
         if embedding_base_url is not None:
             self.global_config.embedding_base_url = embedding_base_url
+
+        self.book_id = book_id
+
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self.global_config).items()])
         logger.debug(f"ComoRAG init with config:\n  {_print_config}\n")
         llm_label = self.global_config.llm_name.replace("/", "_")
@@ -104,50 +107,20 @@ class ComoRAG:
         self.rerank_filter = DSPyFilter(self)
         self.ready_to_retrieve = False
         self.flag_cluster = False
-
-        if self.global_config.need_cluster:
-            self.sem_embedding_store = EmbeddingStore(self.embedding_model,
-                                                   os.path.join(self.working_dir, "summary_embeddings"),
-                                                   self.global_config.embedding_batch_size, 'summary')
-            if self.sem_embedding_store.get_all_ids():
-                self.flag_cluster = True
-            
-            self.epi_embedding_store = EmbeddingStore(self.embedding_model,
-                                                   os.path.join(self.working_dir, "timeline_embeddings"),
-                                                   self.global_config.embedding_batch_size, 'timeline')
-            
-
-            
-            self.summarization_model = GPT4SummarizationModel(self.global_config.llm_name,self.global_config.llm_base_url,self.global_config.llm_api_key)
-            self.timeline_summarizer = TimelineSummarizer(
-                chunk_embedding_store=self.ver_embedding_store,
-                summary_embedding_store=self.epi_embedding_store,
-                summarization_model=self.summarization_model
-            )
-            
-
-            if not self.flag_cluster:                       
-                self.clustering = ChunkSoftClustering(
-                    embedding_store=self.ver_embedding_store,
-                    reduction_dimension=10,
-                    threshold=0.01,
-                    verbose=True,
-                    db_filename=self.working_dir,
-                    namespace="rag_chunks",
-                    summarization_model=self.summarization_model,
-                    llm_model_name=self.global_config.llm_name,
-                    llm_base_url=self.global_config.llm_base_url,
-                    llm_api_key=self.global_config.llm_api_key
-                )
-                
-            self.timeline_summarizer.load_all_summaries()
-            self.level_store = self.timeline_summarizer.get_level_embedding_store(0)
+        self.sem_embedding_store = None
+        self.epi_embedding_store = None
+        self.summarization_model = None
+        self.timeline_summarizer = None
+        self.clustering = None
+        self.level_store = None
 
         self.steps = self.global_config.max_iterations
         self.max_tokens_ver = self.global_config.max_tokens_ver
         self.max_tokens_sem = self.global_config.max_tokens_sem
         self.max_tokens_epi = self.global_config.max_tokens_epi
+
         if self.global_config.need_cluster:
+            self._ensure_cluster_components()
             self.level_store = self.timeline_summarizer.get_level_embedding_store(0)
 
         self.tokenizer = self._build_tokenizer()
@@ -170,6 +143,53 @@ class ComoRAG:
         if hasattr(self.tokenizer, "encode"):
             return len(self.tokenizer.encode(text))
         return len(text.split())
+
+    def _ensure_cluster_components(self):
+        if self.sem_embedding_store is None:
+            self.sem_embedding_store = EmbeddingStore(
+                self.embedding_model,
+                os.path.join(self.working_dir, "summary_embeddings"),
+                self.global_config.embedding_batch_size,
+                'summary',
+            )
+        if self.epi_embedding_store is None:
+            self.epi_embedding_store = EmbeddingStore(
+                self.embedding_model,
+                os.path.join(self.working_dir, "timeline_embeddings"),
+                self.global_config.embedding_batch_size,
+                'timeline',
+            )
+
+        self.flag_cluster = bool(self.sem_embedding_store.get_all_ids())
+
+        if self.summarization_model is None:
+            self.summarization_model = CommSummarizationModel(
+                self.global_config.llm_name,
+                self.global_config.llm_base_url,
+                self.global_config.llm_api_key,
+            )
+        if self.timeline_summarizer is None:
+            self.timeline_summarizer = TimelineSummarizer(
+                chunk_embedding_store=self.ver_embedding_store,
+                summary_embedding_store=self.epi_embedding_store,
+                summarization_model=self.summarization_model,
+            )
+        if self.clustering is None and not self.flag_cluster:
+            self.clustering = ChunkSoftClustering(
+                embedding_store=self.ver_embedding_store,
+                reduction_dimension=10,
+                threshold=0.01,
+                verbose=True,
+                db_filename=self.working_dir,
+                namespace="rag_chunks",
+                summarization_model=self.summarization_model,
+                llm_model_name=self.global_config.llm_name,
+                llm_base_url=self.global_config.llm_base_url,
+                llm_api_key=self.global_config.llm_api_key,
+            )
+        if self.level_store is None:
+            self.timeline_summarizer.load_all_summaries()
+            self.level_store = self.timeline_summarizer.get_level_embedding_store(0)
         
     def initialize_graph(self):
         self._graphml_xml_file = os.path.join(
@@ -214,22 +234,19 @@ class ComoRAG:
         logger.info(f"Performing OpenIE")
         if self.global_config.openie_mode == 'offline':
             self.pre_openie(docs)
+
+        # 理论上已经构建过的不会重新构建
         self.ver_embedding_store.insert_strings(docs)
+
         if self.global_config.need_cluster:
+            self._ensure_cluster_components()
             timeline_dir = os.path.join(self.working_dir, "timeline_embeddings")
             os.makedirs(timeline_dir, exist_ok=True)
-            self.epi_embedding_store = EmbeddingStore(
-                self.embedding_model,
-                timeline_dir,
-                self.global_config.embedding_batch_size,
-                'timeline'
-            )
-            
             self.timeline_summarizer.try_load_or_generate_summaries(timeline_dir)
             self.timeline_summarizer.load_all_summaries()
             self.level_store = self.timeline_summarizer.get_level_embedding_store(0)
 
-        if self.global_config.need_cluster and not self.flag_cluster:  
+        if self.global_config.need_cluster and not self.flag_cluster:
             all_summaries, final_summary = self._recursive_clustering(
                 [self.ver_embedding_store.get_row(hash_id)['content'] for hash_id in self.ver_embedding_store.get_all_ids()],
                 max_iterations=5  # Set maximum iteration count
@@ -247,11 +264,34 @@ class ComoRAG:
             self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
         if self.global_config.save_openie:
             self.save_openie_results(all_openie_info)
-        ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)    
-        assert len(chunks) == len(ner_results_dict) == len(triple_results_dict)
+        ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
 
         # prepare data_store
         chunk_ids = list(chunks.keys())
+        missing_keys = [
+            chunk_id for chunk_id in chunk_ids
+            if chunk_id not in ner_results_dict or chunk_id not in triple_results_dict
+        ]
+        if missing_keys:
+            logger.warning(
+                "OpenIE cache is incomplete for %s chunks, filling empty extraction results.",
+                len(missing_keys),
+            )
+            for chunk_id in missing_keys:
+                if chunk_id not in ner_results_dict:
+                    ner_results_dict[chunk_id] = NerRawOutput(
+                        chunk_id=chunk_id,
+                        response="",
+                        unique_entities=[],
+                        metadata={},
+                    )
+                if chunk_id not in triple_results_dict:
+                    triple_results_dict[chunk_id] = TripleRawOutput(
+                        chunk_id=chunk_id,
+                        response="",
+                        triples=[],
+                        metadata={},
+                    )
         
         chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in chunk_ids]
         entity_nodes, chunk_triple_entities = extract_entity_nodes(chunk_triples)
@@ -446,6 +486,7 @@ class ComoRAG:
         queries_solutions = []
         step_answers = {}
         if self.global_config.need_cluster:
+            self._ensure_cluster_components()
             self.level_store = self.timeline_summarizer.get_level_embedding_store(0)
         max_workers = min(16, len(queries)) 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -484,14 +525,7 @@ class ComoRAG:
         self.get_query_embeddings(query)
 
         # Veridical Index Retrieval
-        query_fact_scores = self.get_fact_scores(query)
-        link_top_k: int = self.global_config.linking_top_k
-        candidate_fact_indices = np.argsort(query_fact_scores)[-link_top_k:][::-1].tolist()
-        real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
-        fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
-        candidate_facts = [eval(fact_row_dict[id]['content']) for id in real_candidate_fact_ids]
-
-        top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
+        top_k_fact_indices, top_k_facts, rerank_log, fact_scores_by_idx = self.rerank_facts(query)
         nodes = {"idx" : 0,
                 "question" : query,
                 "nodes" : None,
@@ -499,68 +533,95 @@ class ComoRAG:
 
         if len(top_k_facts) == 0:
             logger.info('No facts found after reranking, return DPR results')
-            sorted_doc_ids, sorted_doc_scores = self.dense_passage_retrieval(query)
+            query_embedding = self._get_passage_query_embedding(query)
+            retrieval_k = max(self.global_config.retrieval_top_k, ver_top_k + len(ver_hashes) + 5)
+            sorted_doc_ids, sorted_doc_scores = self.ver_embedding_store.rank_indices_by_vector(
+                query_embedding=query_embedding,
+                top_k=retrieval_k,
+                exclude_hash_ids=set(ver_hashes),
+            )
 
         else:
             self.global_config.passage_node_weight = 0.005
             sorted_doc_ids, sorted_doc_scores,node = self.graph_search_with_fact_entities(query=query,
                                                                                         link_top_k=self.global_config.linking_top_k,
-                                                                                        query_fact_scores=query_fact_scores,
+                                                                                        fact_scores_by_idx=fact_scores_by_idx,
                                                                                         top_k_facts=top_k_facts,
                                                                                         top_k_fact_indices=top_k_fact_indices,
                                                                                         passage_node_weight=self.global_config.passage_node_weight)
             nodes["nodes"] = nodes
-        top_k_docs = [self.ver_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:ver_top_k]]
-        # If chunks exist in pool, return chunks with hash values different from those in pool
-        text_to_hash_id = self.ver_embedding_store.text_to_hash_id
-        top_k_docs_hashes = [text_to_hash_id[doc] for doc in top_k_docs]
-
-        if len(ver_hashes) > 0:
-            top_k_docs = [doc for doc in top_k_docs if text_to_hash_id[doc] not in ver_hashes]
+        top_k_docs: List[str] = []
+        selected_ver_hashes: List[str] = []
+        for idx in sorted_doc_ids:
+            if idx >= len(self.passage_node_keys):
+                continue
+            hash_id = self.passage_node_keys[idx]
+            if hash_id in ver_hashes:
+                continue
+            row = self.ver_embedding_store.get_row(hash_id)
+            top_k_docs.append(row["content"])
+            selected_ver_hashes.append(hash_id)
+            if len(top_k_docs) >= ver_top_k:
+                break
 
         hash_id_to_order = self.ver_embedding_store.get_hash_id_to_order()
-        text_to_hash_id = self.ver_embedding_store.text_to_hash_id
-        retrieved_passages = top_k_docs
-        retrieved_passages_sorted = sorted(retrieved_passages,key=lambda doc: hash_id_to_order.get(text_to_hash_id.get(doc), float('inf')))
-        top_k_docs = retrieved_passages_sorted
+        top_k_docs = [
+            doc for _, doc in sorted(
+                zip(selected_ver_hashes, top_k_docs),
+                key=lambda pair: hash_id_to_order.get(pair[0], float('inf')),
+            )
+        ]
         
 
         # Semantic Index Retrieval
         top_k_sem = []
         top_k_epi = []
         if self.global_config.need_cluster:
-            sorted_sem_ids, sorted_sem_scores = self.dense_passage_retrieval(query, need_cluster=True)
-            top_k_sem = [self.sem_embedding_store.get_row(self.summary_node_keys[idx])["content"] for idx in sorted_sem_ids[:sem_top_k]]
-            # If summaries exist in pool, return summaries with hash values different from those in pool
-            text_to_hash_id = self.sem_embedding_store.text_to_hash_id
-            top_k_sem_hashes = [text_to_hash_id[doc] for doc in top_k_sem]
-
-            if len(sem_hashes) > 0:
-                top_k_sem = [sem for sem in top_k_sem if text_to_hash_id[sem] not in sem_hashes]
+            query_embedding = self._get_passage_query_embedding(query)
+            sem_retrieval_k = max(self.global_config.retrieval_top_k, sem_top_k + len(sem_hashes) + 5)
+            sem_indices, _ = self.sem_embedding_store.rank_indices_by_vector(
+                query_embedding=query_embedding,
+                top_k=sem_retrieval_k,
+                exclude_hash_ids=set(sem_hashes),
+            )
+            selected_sem_hashes: List[str] = []
+            for idx in sem_indices:
+                if idx >= len(self.summary_node_keys):
+                    continue
+                hash_id = self.summary_node_keys[idx]
+                if hash_id in sem_hashes:
+                    continue
+                top_k_sem.append(self.sem_embedding_store.get_row(hash_id)["content"])
+                selected_sem_hashes.append(hash_id)
+                if len(top_k_sem) >= sem_top_k:
+                    break
 
             ### Episodic Index Retrieval
-            top_k_epi, sorted_epi_scores = get_similar_summaries(
-                    query=query,
-                    level_store=self.level_store,
-                    embedding_model=self.timeline_summarizer.summary_store.embedding_model,
-                    top_k=epi_top_k
+            epi_retrieval_k = max(self.global_config.retrieval_top_k, epi_top_k + len(epi_hashes) + 5)
+            epi_indices, _ = self.level_store.rank_indices_by_vector(
+                query_embedding=query_embedding,
+                top_k=epi_retrieval_k,
+                exclude_hash_ids=set(epi_hashes),
+            )
+            selected_epi_hashes: List[str] = []
+            for idx in epi_indices:
+                if idx >= len(self.level_store.hash_ids):
+                    continue
+                hash_id = self.level_store.hash_ids[idx]
+                if hash_id in epi_hashes:
+                    continue
+                top_k_epi.append(self.level_store.get_row(hash_id)["content"])
+                selected_epi_hashes.append(hash_id)
+                if len(top_k_epi) >= epi_top_k:
+                    break
+
+            epi_order = self.level_store.get_hash_id_to_order()
+            top_k_epi = [
+                doc for _, doc in sorted(
+                    zip(selected_epi_hashes, top_k_epi),
+                    key=lambda pair: epi_order.get(pair[0], float('inf')),
                 )
-            top_k_epi = top_k_epi[:epi_top_k]
-
-            # epi result
-            if len(top_k_epi) > 0:
-                text_to_hash_id = self.level_store.text_to_hash_id
-                top_k_epi_hashes = [text_to_hash_id[doc] for doc in top_k_epi]
-
-            if len(epi_hashes) > 0:
-                top_k_epi = [epi for epi in top_k_epi if text_to_hash_id[epi] not in epi_hashes]
-
-            hash_id_to_order = self.level_store.get_hash_id_to_order()
-            text_to_hash_id =  self.level_store.text_to_hash_id  
-            retrieved_passages = top_k_epi
-            retrieved_passages_sorted = sorted(retrieved_passages,
-                                            key=lambda doc: hash_id_to_order.get(text_to_hash_id.get(doc), float('inf')))
-            top_k_epi = retrieved_passages_sorted
+            ]
 
         docs = {
             "veridical":top_k_docs,
@@ -729,18 +790,28 @@ class ComoRAG:
 
     def load_existing_openie(self, chunk_keys: List[str]) -> Tuple[List[dict], Set[str]]:
 
-        chunk_keys_to_save = set()
+        chunk_keys = list(chunk_keys)
+        chunk_key_set = set(chunk_keys)
+        chunk_keys_to_save: Set[str] = set()
 
         if os.path.isfile(self.openie_results_path):
             openie_results = json.load(open(self.openie_results_path))
             all_openie_info = openie_results.get('docs', [])
 
-            renamed_openie_info = []
+            # Normalize old cache records and deduplicate by chunk idx.
+            dedup_openie: Dict[str, dict] = {}
             for openie_info in all_openie_info:
-                openie_info['idx'] = compute_mdhash_id(openie_info['passage'], 'chunk-')
-                renamed_openie_info.append(openie_info)
+                idx = openie_info.get('idx')
+                if not idx:
+                    passage = openie_info.get('passage', '')
+                    idx = compute_mdhash_id(passage, 'chunk-')
+                # Keep only chunks in current indexing scope.
+                if idx in chunk_key_set:
+                    normalized = dict(openie_info)
+                    normalized['idx'] = idx
+                    dedup_openie[idx] = normalized
 
-            all_openie_info = renamed_openie_info
+            all_openie_info = list(dedup_openie.values())
 
             existing_openie_keys = set([info['idx'] for info in all_openie_info])
 
@@ -775,8 +846,10 @@ class ComoRAG:
         num_phrases = sum([len(chunk['extracted_entities']) for chunk in all_openie_info])
 
         if len(all_openie_info) > 0:
-            openie_dict = {'docs': all_openie_info, 'avg_ent_chars': round(sum_phrase_chars / num_phrases, 4),
-                           'avg_ent_words': round(sum_phrase_words / num_phrases, 4)}
+            avg_ent_chars = round(sum_phrase_chars / num_phrases, 4) if num_phrases > 0 else 0
+            avg_ent_words = round(sum_phrase_words / num_phrases, 4) if num_phrases > 0 else 0
+            openie_dict = {'docs': all_openie_info, 'avg_ent_chars': avg_ent_chars,
+                           'avg_ent_words': avg_ent_words}
             with open(self.openie_results_path, 'w') as f:
                 json.dump(openie_dict, f)
             logger.info(f"OpenIE results saved to {self.openie_results_path}")
@@ -902,6 +975,10 @@ class ComoRAG:
         self.fact_node_keys: List = list(self.fact_embedding_store.get_all_ids())
         if self.global_config.need_cluster:
             self.summary_node_keys: List = list(self.sem_embedding_store.get_all_ids())
+        self.fact_id_to_idx = {node_id: idx for idx, node_id in enumerate(self.fact_node_keys)}
+        self.passage_id_to_idx = {node_id: idx for idx, node_id in enumerate(self.passage_node_keys)}
+        if self.global_config.need_cluster:
+            self.summary_id_to_idx = {node_id: idx for idx, node_id in enumerate(self.summary_node_keys)}
 
         igraph_name_to_idx = {node["name"]: idx for idx, node in enumerate(self.graph.vs)} # from node key to the index in the backbone graph
         self.node_name_to_vertex_idx = igraph_name_to_idx
@@ -951,28 +1028,24 @@ class ComoRAG:
             for query, embedding in zip(all_query_strings, query_embeddings_for_passage):
                 self.query_to_embedding['passage'][query] = embedding
 
-    def get_fact_scores(self, query: str) -> np.ndarray:
+    def get_top_fact_scores(self, query: str, top_k: Optional[int] = None):
  
         query_embedding = self.query_to_embedding['triple'].get(query, None)
         if query_embedding is None:
             query_embedding = self.embedding_model.batch_encode(query,
                                                                 instruction=get_query_instruction('query_to_fact'),
                                                                 norm=True)
-        query_fact_scores = self.fact_embedding_store.score_all(query_embedding)
-        query_fact_scores = np.asarray(query_fact_scores)
-        if query_fact_scores.ndim == 0:
-            query_fact_scores = query_fact_scores.reshape(1)
-        elif query_fact_scores.ndim > 1:
-            query_fact_scores = np.squeeze(query_fact_scores)
-            if query_fact_scores.ndim == 0:
-                query_fact_scores = query_fact_scores.reshape(1)
-        if query_fact_scores.size == 0:
-            return query_fact_scores
-        query_fact_scores = min_max_normalize(query_fact_scores)
+        if top_k is None:
+            top_k = self.global_config.linking_top_k
+        fact_ids, fact_scores = self.fact_embedding_store.search_topk(
+            query_embedding=query_embedding,
+            top_k=max(top_k * 3, top_k),
+        )
+        if fact_scores.size > 0:
+            fact_scores = min_max_normalize(fact_scores)
+        return fact_ids, fact_scores
 
-        return query_fact_scores
-
-    def dense_passage_retrieval(self, query: str, need_cluster: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    def dense_passage_retrieval(self, query: str, need_cluster: bool = False, top_k: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         query_embedding = self.query_to_embedding['passage'].get(query, None)
         if query_embedding is None:
             query_embedding = self.embedding_model.batch_encode(query,
@@ -980,13 +1053,34 @@ class ComoRAG:
                                                                 norm=True)
       
         if need_cluster:
-            sorted_doc_ids, sorted_doc_scores = self.sem_embedding_store.rank_by_vector(query_embedding)
+            if top_k is None:
+                top_k = len(self.summary_node_keys) if hasattr(self, "summary_node_keys") else self.global_config.retrieval_top_k
+            sorted_doc_ids, sorted_doc_scores = self.sem_embedding_store.rank_indices_by_vector(
+                query_embedding=query_embedding,
+                top_k=top_k,
+            )
         else:
-            sorted_doc_ids, sorted_doc_scores = self.ver_embedding_store.rank_by_vector(query_embedding)
+            if top_k is None:
+                top_k = self.global_config.retrieval_top_k
+            sorted_doc_ids, sorted_doc_scores = self.ver_embedding_store.rank_indices_by_vector(
+                query_embedding=query_embedding,
+                top_k=top_k,
+            )
         sorted_doc_scores = np.asarray(sorted_doc_scores)
         if sorted_doc_scores.size > 0:
             sorted_doc_scores = min_max_normalize(sorted_doc_scores)
         return sorted_doc_ids, sorted_doc_scores
+
+    def _get_passage_query_embedding(self, query: str) -> np.ndarray:
+        query_embedding = self.query_to_embedding['passage'].get(query, None)
+        if query_embedding is None:
+            query_embedding = self.embedding_model.batch_encode(
+                query,
+                instruction=get_query_instruction('query_to_passage'),
+                norm=True,
+            )
+            self.query_to_embedding['passage'][query] = query_embedding
+        return query_embedding
 
 
 
@@ -996,7 +1090,13 @@ class ComoRAG:
                           all_phrase_weights: np.ndarray,
                           linking_score_map: Dict[str, float]) -> Tuple[np.ndarray, Dict[str, float]]:
 
+        # Keep top-k candidates first.
         linking_score_map = dict(sorted(linking_score_map.items(), key=lambda x: x[1], reverse=True)[:link_top_k])
+        # Drop zero/negative-score entities early; they cannot contribute to reset weights.
+        linking_score_map = {
+            phrase: score for phrase, score in linking_score_map.items()
+            if score is not None and float(score) > 0
+        }
 
         top_k_phrases = set(linking_score_map.keys())
         top_k_phrases_keys = set(
@@ -1008,14 +1108,41 @@ class ComoRAG:
                 if phrase_id is not None:
                     all_phrase_weights[phrase_id] = 0.0
 
-        assert np.count_nonzero(all_phrase_weights) == len(linking_score_map.keys())
+        # Reconcile mismatch by pruning entities that are not usable at runtime.
+        pruned_linking_score_map: Dict[str, float] = {}
+        problematic_phrases = []
+        for phrase, score in linking_score_map.items():
+            phrase_key = compute_mdhash_id(content=phrase, prefix="entity-")
+            phrase_id = self.node_name_to_vertex_idx.get(phrase_key)
+            exists_in_graph = phrase_id is not None
+            current_weight = float(all_phrase_weights[phrase_id]) if exists_in_graph else 0.0
+            if exists_in_graph and current_weight > 0:
+                pruned_linking_score_map[phrase] = score
+            else:
+                problematic_phrases.append(
+                    {
+                        "phrase": phrase,
+                        "phrase_key": phrase_key,
+                        "exists_in_graph": exists_in_graph,
+                        "weight": round(current_weight, 6),
+                        "score": round(float(score), 6),
+                    }
+                )
+
+        if problematic_phrases:
+            logger.warning(
+                "Pruned unusable linking entities: count=%s sample=%s",
+                len(problematic_phrases),
+                problematic_phrases[:10],
+            )
+        linking_score_map = pruned_linking_score_map
         return all_phrase_weights, linking_score_map
 
     def  graph_search_with_fact_entities(self, query: str,
                                         link_top_k: int,
-                                        query_fact_scores: np.ndarray,
+                                        fact_scores_by_idx: Dict[int, float],
                                         top_k_facts: List[Tuple],
-                                        top_k_fact_indices: List[str],
+                                        top_k_fact_indices: List[int],
                                         passage_node_weight: float = 0.05) -> Tuple[np.ndarray, np.ndarray]:
     
         linking_score_map = {}  # from phrase to the average scores of the facts that contain the phrase 
@@ -1028,8 +1155,7 @@ class ComoRAG:
             subject_phrase = f[0].lower()
             predicate_phrase = f[1].lower()
             object_phrase = f[2].lower()
-            fact_score = query_fact_scores[
-                top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
+            fact_score = fact_scores_by_idx.get(top_k_fact_indices[rank], 0.0)
             for phrase in [subject_phrase, object_phrase]:
                 phrase_key = compute_mdhash_id(
                     content=phrase,
@@ -1038,9 +1164,14 @@ class ComoRAG:
                 phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
 
                 if phrase_id is not None:
-                    phrase_weights[phrase_id] = fact_score
+                    # Algorithm rule:
+                    # For entities appearing in multiple facts, aggregate with MAX contribution
+                    # instead of overwrite. This avoids a later low/zero-score fact wiping out
+                    # a previously strong entity signal.
+                    candidate_weight = fact_score
                     if self.ent_node_to_num_chunk[phrase_key] != 0:
-                        phrase_weights[phrase_id] /= self.ent_node_to_num_chunk[phrase_key]
+                        candidate_weight /= self.ent_node_to_num_chunk[phrase_key]
+                    phrase_weights[phrase_id] = max(phrase_weights[phrase_id], candidate_weight)
                     if phrase_weights[phrase_id] > 0:
                         used_phrases_with_scores[phrase] = phrase_weights[phrase_id]
                 if phrase not in phrase_scores:
@@ -1053,7 +1184,10 @@ class ComoRAG:
             phrase_weights, linking_score_map = self.get_top_k_weights(link_top_k,
                                                                            phrase_weights,
                                                                            linking_score_map)
-        dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
+        dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(
+            query,
+            top_k=self.global_config.retrieval_top_k,
+        )
         normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
         for i, dpr_sorted_doc_id in enumerate(dpr_sorted_doc_ids.tolist()):
             passage_node_key = self.passage_node_keys[dpr_sorted_doc_id]
@@ -1076,7 +1210,7 @@ class ComoRAG:
 
         return ppr_sorted_doc_ids, ppr_sorted_doc_scores,used_phrases_with_scores
 
-    def rerank_facts(self, query: str, query_fact_scores: np.ndarray) -> Tuple[List[int], List[Tuple], dict]:
+    def rerank_facts(self, query: str) -> Tuple[List[int], List[Tuple], dict, Dict[int, float]]:
         """
 
         Args:
@@ -1092,10 +1226,20 @@ class ComoRAG:
         """
         link_top_k: int = self.global_config.linking_top_k
 
-        candidate_fact_indices = np.argsort(query_fact_scores)[-link_top_k:][::-1].tolist()
+        candidate_fact_ids, candidate_scores = self.get_top_fact_scores(query, top_k=link_top_k)
+        if not candidate_fact_ids:
+            return [], [], {"facts_before_rerank": [], "facts_after_rerank": []}, {}
+        candidate_fact_indices = [
+            self.fact_id_to_idx[fid] for fid in candidate_fact_ids if fid in self.fact_id_to_idx
+        ]
         real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
         fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
         candidate_facts = [eval(fact_row_dict[id]['content']) for id in real_candidate_fact_ids]
+        fact_scores_by_idx = {
+            idx: float(candidate_scores[pos])
+            for pos, idx in enumerate(candidate_fact_indices)
+            if pos < len(candidate_scores)
+        }
 
         top_k_fact_indices, top_k_facts, reranker_dict = self.rerank_filter(query,
                                                                              candidate_facts,
@@ -1103,7 +1247,7 @@ class ComoRAG:
                                                                              len_after_rerank=link_top_k)
 
         rerank_log = {'facts_before_rerank': candidate_facts, 'facts_after_rerank': top_k_facts}
-        return top_k_fact_indices, top_k_facts, rerank_log
+        return top_k_fact_indices, top_k_facts, rerank_log, fact_scores_by_idx
     
     def run_ppr(self,
                 reset_prob: np.ndarray,

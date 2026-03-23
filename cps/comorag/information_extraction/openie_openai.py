@@ -27,6 +27,13 @@ class LLMInput:
     input_message: List[Dict]
 
 
+def _safe_metric(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _extract_ner_from_response(real_response):
     # Try multiple formats
     # Format 1: {"named_entities": ["entity1", "entity2"]}
@@ -228,9 +235,9 @@ class OpenIE:
                 result = future.result()
                 ner_results_list.append(result)
                 # Update metrics based on the metadata from the result
-                metadata = result.metadata
-                total_prompt_tokens += metadata.get('prompt_tokens', 0)
-                total_completion_tokens += metadata.get('completion_tokens', 0)
+                metadata = result.metadata or {}
+                total_prompt_tokens += _safe_metric(metadata.get('prompt_tokens', 0))
+                total_completion_tokens += _safe_metric(metadata.get('completion_tokens', 0))
                 if metadata.get('cache_hit'):
                     num_cache_hit += 1
 
@@ -255,9 +262,9 @@ class OpenIE:
             for future in pbar:
                 result = future.result()
                 triple_results_list.append(result)
-                metadata = result.metadata
-                total_prompt_tokens += metadata.get('prompt_tokens', 0)
-                total_completion_tokens += metadata.get('completion_tokens', 0)
+                metadata = result.metadata or {}
+                total_prompt_tokens += _safe_metric(metadata.get('prompt_tokens', 0))
+                total_completion_tokens += _safe_metric(metadata.get('completion_tokens', 0))
                 if metadata.get('cache_hit'):
                     num_cache_hit += 1
                 pbar.set_postfix({

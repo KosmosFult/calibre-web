@@ -215,6 +215,7 @@ Please provide a complete summary that ensures:
 4. Uses clear and fluent language
 5. Forms a complete narrative rather than a simple list of points
 6. Ensures the completeness and coherence of the summary, allowing readers to fully understand the entire story
+7. Output only the summary body text. Do not add prefaces like "Here is a summary", titles, or meta commentary.
 """
         else:
             return f"""Please summarize the following text, maintaining timeline coherence, highlighting key events while preserving important information:
@@ -226,6 +227,7 @@ Please provide a coherent summary that ensures:
 2. Highlights important events and turning points
 3. Preserves key details
 4. Uses clear language
+5. Output only the summary body text. Do not add prefaces, headings, or explanatory boilerplate.
 """
     
     def _summarize_window(self, texts: List[str], is_final_summary: bool = False) -> str:
@@ -296,6 +298,8 @@ Please provide a coherent summary that ensures:
         # Get all text chunks
         all_ids = self.chunk_store.get_all_ids()
         all_texts = [self.chunk_store.hash_id_to_text[id] for id in all_ids]
+        chunk_order_map = self.chunk_store.get_hash_id_to_order()
+        all_orders = [chunk_order_map.get(id, -1) for id in all_ids]
         total_chunks = len(all_texts)
         
         # Store summaries
@@ -332,6 +336,11 @@ Please provide a coherent summary that ensures:
         # Sort results by window index
         window_results.sort(key=lambda x: x[0])
         level_summaries = [summary for _, summary in window_results]
+        level_source_orders = []
+        for window_idx, _summary in window_results:
+            start_idx = window_idx * window_size
+            end_idx = min(start_idx + window_size, len(all_orders))
+            level_source_orders.append([order for order in all_orders[start_idx:end_idx] if order >= 0])
         
         summaries_by_level.append(level_summaries)
         
@@ -343,11 +352,12 @@ Please provide a coherent summary that ensures:
             namespace="level_0",
             book_id=self.book_id,
         )
-        level_store.insert_strings(level_summaries)
+        level_store.insert_strings(level_summaries, source_order_ids=level_source_orders)
         
         return {
             "total_levels": 1,
-            "summaries_by_level": summaries_by_level
+            "summaries_by_level": summaries_by_level,
+            "source_orders_by_level": [level_source_orders],
         }
 
     def get_summary_by_level(self, level: int) -> List[str]:
@@ -519,7 +529,10 @@ Please provide a coherent summary that ensures:
         # Ensure summaries for each level are correctly saved
         for level, summaries in enumerate(timeline_result["summaries_by_level"]):
             level_store = self.get_level_embedding_store(level, output_dir)
-            level_store.insert_strings(summaries)
+            source_orders = None
+            if "source_orders_by_level" in timeline_result:
+                source_orders = timeline_result["source_orders_by_level"][level]
+            level_store.insert_strings(summaries, source_order_ids=source_orders)
         
         logger.info(f"Summary generation completed, saved to {output_dir}")
         

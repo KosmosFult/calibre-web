@@ -6,6 +6,7 @@ from copy import deepcopy
 import datetime
 import sqlite3
 import re
+import json
 
 import lancedb
 
@@ -131,11 +132,18 @@ class EmbeddingStore:
 
         return {h: {"hash_id": h, "content": t} for h, t in zip(missing_ids, texts_to_encode)}
 
-    def insert_strings(self, texts: List[str]):
+    def insert_strings(self, texts: List[str], source_order_ids: Optional[List[Optional[List[int]]]] = None):
         nodes_dict = {}
+        source_by_hash: Dict[str, List[int]] = {}
 
-        for text in texts:
-            nodes_dict[compute_mdhash_id(text, prefix=self.namespace + "-")] = {'content': text}
+        if source_order_ids is not None and len(source_order_ids) != len(texts):
+            raise ValueError("source_order_ids length must match texts length")
+
+        for idx, text in enumerate(texts):
+            hash_id = compute_mdhash_id(text, prefix=self.namespace + "-")
+            nodes_dict[hash_id] = {'content': text}
+            if source_order_ids is not None:
+                source_by_hash[hash_id] = source_order_ids[idx] or []
 
         # Get all hash_ids from the input dictionary.
         all_hash_ids = list(nodes_dict.keys())
@@ -158,7 +166,8 @@ class EmbeddingStore:
 
         missing_embeddings = self.embedding_model.batch_encode(texts_to_encode)
 
-        self._upsert(missing_ids, texts_to_encode, missing_embeddings)
+        source_for_missing = {h: source_by_hash.get(h, []) for h in missing_ids}
+        self._upsert(missing_ids, texts_to_encode, missing_embeddings, source_order_ids_by_hash=source_for_missing)
 
     def _ensure_tables(self):
         with self._connect() as conn:
@@ -171,6 +180,7 @@ class EmbeddingStore:
                     namespace TEXT NOT NULL,
                     hash_id TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    source_order_ids TEXT,
                     embedding BLOB NOT NULL,
                     embedding_dim INTEGER NOT NULL,
                     order_index INTEGER NOT NULL,
@@ -186,6 +196,10 @@ class EmbeddingStore:
                 ON {self.meta_table}(book_id, namespace, order_index)
                 """
             )
+            cur.execute(f"PRAGMA table_info({self.meta_table})")
+            existing_cols = {row[1] for row in cur.fetchall()}
+            if "source_order_ids" not in existing_cols:
+                cur.execute(f"ALTER TABLE {self.meta_table} ADD COLUMN source_order_ids TEXT")
             conn.commit()
 
     def _load_data(self):
@@ -197,7 +211,7 @@ class EmbeddingStore:
             cur = conn.cursor()
             cur.execute(
                 f"""
-                SELECT hash_id, content, embedding
+                SELECT hash_id, content, source_order_ids, embedding
                 FROM {self.meta_table}
                 WHERE book_id = ? AND namespace = ?
                 ORDER BY order_index ASC
@@ -206,15 +220,23 @@ class EmbeddingStore:
             )
             rows = cur.fetchall()
 
-        for hash_id, content, embedding_blob in rows:
+        self.hash_id_to_source_orders = {}
+        for hash_id, content, source_order_ids_json, embedding_blob in rows:
             embedding = np.frombuffer(embedding_blob, dtype=np.float32)
             self.hash_ids.append(hash_id)
             self.texts.append(content)
             self.embeddings.append(embedding)
+            source_orders = []
+            if source_order_ids_json:
+                try:
+                    source_orders = json.loads(source_order_ids_json)
+                except ValueError:
+                    source_orders = []
+            self.hash_id_to_source_orders[hash_id] = source_orders
 
         self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
         self.hash_id_to_row = {
-            h: {"hash_id": h, "content": t}
+            h: {"hash_id": h, "content": t, "source_order_ids": self.hash_id_to_source_orders.get(h, [])}
             for h, t in zip(self.hash_ids, self.texts)
         }
         self.hash_id_to_text = {h: self.texts[idx] for idx, h in enumerate(self.hash_ids)}
@@ -230,7 +252,10 @@ class EmbeddingStore:
         self._get_vector_table()
 
     def _save_data(self):
-        self.hash_id_to_row = {h: {"hash_id": h, "content": t} for h, t in zip(self.hash_ids, self.texts)}
+        self.hash_id_to_row = {
+            h: {"hash_id": h, "content": t, "source_order_ids": self.hash_id_to_source_orders.get(h, [])}
+            for h, t in zip(self.hash_ids, self.texts)
+        }
         self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
         self.hash_id_to_text = {h: self.texts[idx] for idx, h in enumerate(self.hash_ids)}
         self.text_to_hash_id = {self.texts[idx]: h for idx, h in enumerate(self.hash_ids)}
@@ -241,11 +266,12 @@ class EmbeddingStore:
             self.namespace,
         )
 
-    def _upsert(self, hash_ids, texts, embeddings):
+    def _upsert(self, hash_ids, texts, embeddings, source_order_ids_by_hash: Optional[Dict[str, List[int]]] = None):
         # 最后TODO: 原子性
 
         if not hash_ids:
             return
+        source_order_ids_by_hash = source_order_ids_by_hash or {}
         self._ensure_tables()
         now = datetime.datetime.utcnow().isoformat()
         order_entries: List[Tuple[str, int]] = []
@@ -262,14 +288,15 @@ class EmbeddingStore:
                 cur.execute(
                     f"""
                     INSERT OR REPLACE INTO {self.meta_table}
-                    (book_id, namespace, hash_id, content, embedding, embedding_dim, order_index, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (book_id, namespace, hash_id, content, source_order_ids, embedding, embedding_dim, order_index, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         self.book_id,
                         self.namespace,
                         hash_id,
                         text,
+                        json.dumps(source_order_ids_by_hash.get(hash_id, []), ensure_ascii=False),
                         emb_arr.tobytes(),
                         int(emb_arr.shape[0]),
                         order_index,
@@ -280,10 +307,18 @@ class EmbeddingStore:
                 order_entries.append((hash_id, order_index))
             conn.commit()
 
-        self._upsert_lancedb(hash_ids=hash_ids, texts=texts, embeddings=embeddings, order_entries=order_entries)
+        self._upsert_lancedb(
+            hash_ids=hash_ids,
+            texts=texts,
+            embeddings=embeddings,
+            order_entries=order_entries,
+            source_order_ids_by_hash=source_order_ids_by_hash,
+        )
         self.embeddings.extend([np.asarray(e, dtype=np.float32) for e in embeddings])
         self.hash_ids.extend(hash_ids)
         self.texts.extend(texts)
+        for hash_id in hash_ids:
+            self.hash_id_to_source_orders[hash_id] = source_order_ids_by_hash.get(hash_id, [])
         logger.info("Saving new records.")
         self._save_data()
 
@@ -293,9 +328,11 @@ class EmbeddingStore:
         texts: List[str],
         embeddings: List[np.ndarray],
         order_entries: List[Tuple[str, int]],
+        source_order_ids_by_hash: Optional[Dict[str, List[int]]] = None,
     ):
         if not hash_ids:
             return
+        source_order_ids_by_hash = source_order_ids_by_hash or {}
         order_map = {h: order for h, order in order_entries}
         records = []
         for hash_id, text, emb in zip(hash_ids, texts, embeddings):
@@ -306,6 +343,7 @@ class EmbeddingStore:
                     "namespace": self.namespace,
                     "hash_id": hash_id,
                     "content": text,
+                    "source_order_ids": source_order_ids_by_hash.get(hash_id, []),
                     "order_index": int(order_map.get(hash_id, -1)),
                     "vector": emb_arr.tolist(),
                 }

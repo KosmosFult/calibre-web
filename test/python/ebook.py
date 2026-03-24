@@ -76,7 +76,7 @@ def build_smoke_docs():
 
 
 def build_query():
-    return "爱埋公主线里的棺材里装的到底是不是帝国军人"
+    return "【恋塚】的帝国女士兵“姐姐大人”真的是世界树洋房里的“姐姐大人”格雷吗"
 
 
 def run_smoke_test():

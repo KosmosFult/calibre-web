@@ -90,9 +90,12 @@ class DSPyFilter:
             **self.default_gen_kwargs
         )
 
-        if len(response) > 1:
-            return response[0]
-        return response
+        # llm_model.infer may return str / list[str] / tuple[str, ...].
+        # Keep a full text response for parser instead of accidentally
+        # slicing a string into a single character.
+        if isinstance(response, (list, tuple)):
+            return response[0] if response else ""
+        return response or ""
 
     def __call__(self, *args, **kwargs):
         return self.rerank(*args, **kwargs)
@@ -102,6 +105,8 @@ class DSPyFilter:
                candidate_items: List[Tuple],
                candidate_indices: List[int],
                len_after_rerank: int =None) -> Tuple[List[int], List[Tuple], dict]:
+        if len_after_rerank is None:
+            len_after_rerank = len(candidate_items)
         fact_before_filter = {"fact": [list(candidate_item) for candidate_item in candidate_items]}
         try:
             # prediction = self.program(question=query, fact_before_filter=json.dumps(fact_before_filter))
@@ -110,13 +115,37 @@ class DSPyFilter:
         except Exception as e:
             print('exception', e)
             generated_facts = []
+
+        # Fallback: if model output is unparseable/empty, keep retrieval candidates.
+        if not generated_facts:
+            return (
+                candidate_indices[:len_after_rerank],
+                candidate_items[:len_after_rerank],
+                {'confidence': None, 'fallback': 'no_generated_facts'},
+            )
+
         result_indices = []
         for generated_fact in generated_facts:
-            closest_matched_fact = difflib.get_close_matches(str(generated_fact), [str(i) for i in candidate_items], n=1, cutoff=0.0)[0]
+            matches = difflib.get_close_matches(
+                str(generated_fact),
+                [str(i) for i in candidate_items],
+                n=1,
+                cutoff=0.0,
+            )
+            if not matches:
+                continue
+            closest_matched_fact = matches[0]
             try:
                 result_indices.append(candidate_items.index(eval(closest_matched_fact)))
             except Exception as e:
                 print('result_indices exception', e)
+
+        if not result_indices:
+            return (
+                candidate_indices[:len_after_rerank],
+                candidate_items[:len_after_rerank],
+                {'confidence': None, 'fallback': 'no_match_from_generated_facts'},
+            )
 
         sorted_candidate_indices = [candidate_indices[i] for i in result_indices]
         sorted_candidate_items = [candidate_items[i] for i in result_indices]

@@ -153,6 +153,63 @@ class ComoRAG:
             return len(self.tokenizer.encode(text))
         return len(text.split())
 
+    @staticmethod
+    def _format_context_blocks(items: List[str], block_label: str) -> str:
+        """
+        Format retrieved evidence as explicitly separated blocks.
+        This prevents the model from treating multiple snippets as one
+        continuous passage.
+        """
+        normalized_items = [str(item).strip() for item in items if str(item).strip()]
+        if not normalized_items:
+            return ""
+        blocks = []
+        for idx, text in enumerate(normalized_items, start=1):
+            marker, body = ComoRAG._extract_reference_marker(text)
+            if marker:
+                blocks.append(f"[{block_label} #{idx} | {marker}]\n{body}")
+            else:
+                blocks.append(f"[{block_label} #{idx}]\n{text}")
+        return "\n\n-----\n\n".join(blocks)
+
+    @staticmethod
+    def _extract_reference_marker(text: str) -> Tuple[str, str]:
+        stripped = str(text).strip()
+        if not stripped:
+            return "", ""
+        lines = stripped.splitlines()
+        first_line = lines[0].strip()
+        if first_line.startswith("[REF ") and first_line.endswith("]"):
+            body = "\n".join(lines[1:]).strip()
+            return first_line[5:-1].strip(), body
+        return "", stripped
+
+    @staticmethod
+    def _format_reference_text(
+        content: str,
+        ref_hash_id: str,
+        order_id: Optional[int] = None,
+        source_order_ids: Optional[List[int]] = None,
+    ) -> str:
+        parts = [f"id={ref_hash_id}"]
+        if order_id is not None:
+            parts.append(f"order_id={order_id}")
+        if source_order_ids:
+            joined_orders = ",".join(str(v) for v in source_order_ids)
+            parts.append(f"source_order_ids={joined_orders}")
+        return f"[REF {' | '.join(parts)}]\n{content}"
+
+    @staticmethod
+    def _format_fusion_history(temp_nodes, main_nodes) -> str:
+        entries = []
+        seq = 1
+        for node in list(temp_nodes) + list(main_nodes):
+            entries.append(
+                f"[FUSION #{seq}]\nProbe: {node.probe}\nFinding:\n{node.cue}"
+            )
+            seq += 1
+        return "\n\n-----\n\n".join(entries)
+
     def _ensure_cluster_components(self):
         if self.sem_embedding_store is None:
             self.sem_embedding_store = EmbeddingStore(
@@ -259,11 +316,16 @@ class ComoRAG:
             self.level_store = self.timeline_summarizer.get_level_embedding_store(0)
 
         if self.global_config.need_cluster and not self.flag_cluster:
-            all_summaries, final_summary = self._recursive_clustering(
-                [self.ver_embedding_store.get_row(hash_id)['content'] for hash_id in self.ver_embedding_store.get_all_ids()],
-                max_iterations=5  # Set maximum iteration count
+            ver_hash_ids = self.ver_embedding_store.get_all_ids()
+            ver_texts = [self.ver_embedding_store.get_row(hash_id)['content'] for hash_id in ver_hash_ids]
+            ver_order_map = self.ver_embedding_store.get_hash_id_to_order()
+            source_orders = [[ver_order_map.get(hash_id, -1)] for hash_id in ver_hash_ids]
+            all_summaries, final_summary, summary_source_orders = self._recursive_clustering(
+                ver_texts,
+                max_iterations=5,  # Set maximum iteration count
+                source_order_ids=source_orders,
             )
-            self.sem_embedding_store.insert_strings(all_summaries)
+            self.sem_embedding_store.insert_strings(all_summaries, source_order_ids=summary_source_orders)
             final_summary_path = os.path.join(self.working_dir, "final_summary.txt")
             with open(final_summary_path, 'w', encoding='utf-8') as f:
                 f.write(final_summary[0])
@@ -349,9 +411,12 @@ class ComoRAG:
         docs, nodes = self.tri_retrieve(retrieve_query, memory_pool)
         memory_pool = self.mem_encode(query=retrieve_query, docs=docs, memory_pool=memory_pool)
         
-        ver_context = "\n".join([ver for node in memory_pool.get_temp_nodes_by_type(NodeType.VER) for ver in node.original_content])
-        sem_context = "\n".join([sem for node in memory_pool.get_temp_nodes_by_type(NodeType.SEM) for sem in node.original_content])
-        epi_context = "\n".join([epi for node in memory_pool.get_temp_nodes_by_type(NodeType.EPI) for epi in node.original_content])
+        ver_items = [ver for node in memory_pool.get_temp_nodes_by_type(NodeType.VER) for ver in node.original_content]
+        sem_items = [sem for node in memory_pool.get_temp_nodes_by_type(NodeType.SEM) for sem in node.original_content]
+        epi_items = [epi for node in memory_pool.get_temp_nodes_by_type(NodeType.EPI) for epi in node.original_content]
+        ver_context = self._format_context_blocks(ver_items, "VER")
+        sem_context = self._format_context_blocks(sem_items, "SEM")
+        epi_context = self._format_context_blocks(epi_items, "EPI")
         
         historical_infomation = ""
         all_steps = [] 
@@ -369,11 +434,11 @@ class ComoRAG:
             }
             prompt_user = ''
             if self.global_config.use_ver:
-                prompt_user += f"### Detail Chunks\n{ver_context}\n\n"
+                prompt_user += f"### Detail Chunks (independent evidence blocks)\n{ver_context}\n\n"
             if self.global_config.use_sem:
-                prompt_user += f"### Semantic Summary\n{sem_context}\n\n"
+                prompt_user += f"### Semantic Summary (independent evidence blocks)\n{sem_context}\n\n"
             if self.global_config.use_epi:
-                prompt_user += f"### Timeline Summary\n{epi_context}\n\n"
+                prompt_user += f"### Timeline Summary (independent evidence blocks)\n{epi_context}\n\n"
             
             if i != 0:
                 prompt_user += f"### Historical Information\n{historical_infomation}\n\n"
@@ -425,16 +490,22 @@ class ComoRAG:
                 historical_infomation = memory_pool.create_fusion_content(probe=retrieve_query,top_k_percent=0.5)
                 memory_pool.add_fused_node(probe=retrieve_query, fused_content=historical_infomation, source_nodes=nodes)
                 
-                sem_context = "\n".join([node.cue for node in memory_pool.get_temp_nodes_by_type(NodeType.SEM)])
-                epi_context = "\n".join([node.cue for node in memory_pool.get_temp_nodes_by_type(NodeType.EPI)])
-                ver_context = "\n".join([node.cue for node in memory_pool.get_temp_nodes_by_type(NodeType.VER)])
-
-                historical_infomation = ""
-                for node in memory_pool.get_temp_nodes_by_type(NodeType.FUSION):
-                    historical_infomation += f"probe : {node.probe}\nFinding : {node.cue}\n"
-                
-                for node in memory_pool.get_nodes_by_type(NodeType.FUSION):
-                    historical_infomation += f"probe : {node.probe}\nFinding : {node.cue}\n"
+                sem_context = self._format_context_blocks(
+                    [node.cue for node in memory_pool.get_temp_nodes_by_type(NodeType.SEM)],
+                    "SEM-CUE",
+                )
+                epi_context = self._format_context_blocks(
+                    [node.cue for node in memory_pool.get_temp_nodes_by_type(NodeType.EPI)],
+                    "EPI-CUE",
+                )
+                ver_context = self._format_context_blocks(
+                    [node.cue for node in memory_pool.get_temp_nodes_by_type(NodeType.VER)],
+                    "VER-CUE",
+                )
+                historical_infomation = self._format_fusion_history(
+                    memory_pool.get_temp_nodes_by_type(NodeType.FUSION),
+                    memory_pool.get_nodes_by_type(NodeType.FUSION),
+                )
                 all_steps.append(step_info)
             else:
                 all_steps.append(step_info)         
@@ -563,7 +634,7 @@ class ComoRAG:
                                                                                         passage_node_weight=self.global_config.passage_node_weight)
             nodes["nodes"] = nodes
         top_k_docs: List[str] = []
-        selected_ver_hashes: List[str] = []
+        selected_ver_rows: List[Tuple[int, str]] = []
         for idx in sorted_doc_ids:
             if idx >= len(self.passage_node_keys):
                 continue
@@ -571,18 +642,19 @@ class ComoRAG:
             if hash_id in ver_hashes:
                 continue
             row = self.ver_embedding_store.get_row(hash_id)
-            top_k_docs.append(row["content"])
-            selected_ver_hashes.append(hash_id)
+            order_id = self.ver_embedding_store.get_hash_id_to_order().get(hash_id)
+            top_k_docs.append(
+                self._format_reference_text(
+                    content=row["content"],
+                    ref_hash_id=hash_id,
+                    order_id=order_id,
+                )
+            )
+            selected_ver_rows.append((order_id if order_id is not None else 10**9, top_k_docs[-1]))
             if len(top_k_docs) >= ver_top_k:
                 break
 
-        hash_id_to_order = self.ver_embedding_store.get_hash_id_to_order()
-        top_k_docs = [
-            doc for _, doc in sorted(
-                zip(selected_ver_hashes, top_k_docs),
-                key=lambda pair: hash_id_to_order.get(pair[0], float('inf')),
-            )
-        ]
+        top_k_docs = [doc for _, doc in sorted(selected_ver_rows, key=lambda pair: pair[0])]
         
 
         # Semantic Index Retrieval
@@ -603,7 +675,16 @@ class ComoRAG:
                 hash_id = self.summary_node_keys[idx]
                 if hash_id in sem_hashes:
                     continue
-                top_k_sem.append(self.sem_embedding_store.get_row(hash_id)["content"])
+                sem_row = self.sem_embedding_store.get_row(hash_id)
+                source_orders = sem_row.get("source_order_ids") or []
+                top_k_sem.append(
+                    self._format_reference_text(
+                        content=sem_row["content"],
+                        ref_hash_id=hash_id,
+                        order_id=self.sem_embedding_store.get_hash_id_to_order().get(hash_id),
+                        source_order_ids=source_orders,
+                    )
+                )
                 selected_sem_hashes.append(hash_id)
                 if len(top_k_sem) >= sem_top_k:
                     break
@@ -615,25 +696,29 @@ class ComoRAG:
                 top_k=epi_retrieval_k,
                 exclude_hash_ids=set(epi_hashes),
             )
-            selected_epi_hashes: List[str] = []
+            selected_epi_rows: List[Tuple[int, str]] = []
             for idx in epi_indices:
                 if idx >= len(self.level_store.hash_ids):
                     continue
                 hash_id = self.level_store.hash_ids[idx]
                 if hash_id in epi_hashes:
                     continue
-                top_k_epi.append(self.level_store.get_row(hash_id)["content"])
-                selected_epi_hashes.append(hash_id)
+                epi_row = self.level_store.get_row(hash_id)
+                order_id = self.level_store.get_hash_id_to_order().get(hash_id)
+                source_orders = epi_row.get("source_order_ids") or []
+                top_k_epi.append(
+                    self._format_reference_text(
+                        content=epi_row["content"],
+                        ref_hash_id=hash_id,
+                        order_id=order_id,
+                        source_order_ids=source_orders,
+                    )
+                )
+                selected_epi_rows.append((order_id if order_id is not None else 10**9, top_k_epi[-1]))
                 if len(top_k_epi) >= epi_top_k:
                     break
 
-            epi_order = self.level_store.get_hash_id_to_order()
-            top_k_epi = [
-                doc for _, doc in sorted(
-                    zip(selected_epi_hashes, top_k_epi),
-                    key=lambda pair: epi_order.get(pair[0], float('inf')),
-                )
-            ]
+            top_k_epi = [doc for _, doc in sorted(selected_epi_rows, key=lambda pair: pair[0])]
 
         docs = {
             "veridical":top_k_docs,
@@ -1284,10 +1369,18 @@ class ComoRAG:
 
         return sorted_doc_ids, sorted_doc_scores
     
-    def _recursive_clustering(self, texts, max_iterations=5, current_iteration=0):
+    def _recursive_clustering(
+        self,
+        texts,
+        max_iterations=5,
+        current_iteration=0,
+        source_order_ids: Optional[List[List[int]]] = None,
+    ):
         # Create temporary folder paths
         temp_embeddings_dir = os.path.join(self.working_dir, "temp_embeddings")
         temp_clusters_dir = os.path.join(self.working_dir, "temp_clusters")
+        if source_order_ids is None:
+            source_order_ids = [[idx] for idx in range(len(texts))]
         
         # Define cleanup function
         def cleanup_temp_folders():
@@ -1305,11 +1398,11 @@ class ComoRAG:
         # Early return cases
         if len(texts) <= 1:
             cleanup_temp_folders()
-            return texts, texts
+            return texts, texts, source_order_ids
             
         if current_iteration >= max_iterations:
             cleanup_temp_folders()
-            return texts, [texts[0]]
+            return texts, [texts[0]], [source_order_ids[0] if source_order_ids else []]
         
         try:
             temp_embedding_store = EmbeddingStore(
@@ -1321,6 +1414,11 @@ class ComoRAG:
             )
             
             temp_embedding_store.insert_strings(texts)
+            text_hash_ids = [compute_mdhash_id(text, prefix=temp_embedding_store.namespace + "-") for text in texts]
+            hash_to_source_orders = {
+                hash_id: sorted(set(source_order_ids[idx]))
+                for idx, hash_id in enumerate(text_hash_ids)
+            }
             
             clustering = ChunkSoftClustering(
                 embedding_store=temp_embedding_store,
@@ -1341,6 +1439,7 @@ class ComoRAG:
             print(f"Clustering stats: {stats}")
             
             summary_texts = []
+            summary_source_orders = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(clusters))) as executor:
                 future_to_cluster = {
                     executor.submit(clustering.create_cluster_summary, cluster.id): cluster 
@@ -1352,6 +1451,11 @@ class ComoRAG:
                         summary = future.result()
                         if summary:  
                             summary_texts.append(summary)
+                            cluster = future_to_cluster[future]
+                            cluster_source_orders = set()
+                            for member_hash_id in cluster.members.keys():
+                                cluster_source_orders.update(hash_to_source_orders.get(member_hash_id, []))
+                            summary_source_orders.append(sorted(cluster_source_orders))
                     except Exception as e:
                         logger.error(f"error: {str(e)}")
             
@@ -1360,14 +1464,19 @@ class ComoRAG:
             
             # Recursively process next level
             if len(summary_texts) == 1:
-                return summary_texts, summary_texts
+                return summary_texts, summary_texts, summary_source_orders
             
-            next_level_summaries, final_summary = self._recursive_clustering(
+            next_level_summaries, final_summary, next_level_source_orders = self._recursive_clustering(
                 summary_texts, 
                 max_iterations=max_iterations,
-                current_iteration=current_iteration + 1
+                current_iteration=current_iteration + 1,
+                source_order_ids=summary_source_orders,
             )
-            return summary_texts + next_level_summaries, final_summary
+            return (
+                summary_texts + next_level_summaries,
+                final_summary,
+                summary_source_orders + next_level_source_orders,
+            )
             
         except Exception as e:
             # Ensure temporary folders are cleaned up even in case of exceptions

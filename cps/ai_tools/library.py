@@ -2,10 +2,12 @@ import base64
 import json
 import logging
 import os
+import re
 
 from sqlalchemy.sql.expression import func
 
 from .. import calibre_db, config, db
+from ..comorag import service as comorag_service
 from .registry import AgentTool
 
 log = logging.getLogger("calibre-web.ai")
@@ -430,6 +432,139 @@ def read_book_chapter(book_id: int, chapter_index: int = 0, max_words: int = 300
         return json.dumps({"status": "error", "message": str(e)})
 
 
+def _extract_order_ids_from_rag_fields(*fields):
+    order_ids = set()
+    source_pattern = re.compile(r"source_order_ids=([0-9,\s]+)")
+    order_pattern = re.compile(r"order_id=(\d+)")
+
+    for field in fields:
+        if not field:
+            continue
+        text = str(field)
+        for match in order_pattern.findall(text):
+            try:
+                order_ids.add(int(match))
+            except ValueError:
+                continue
+        for segment in source_pattern.findall(text):
+            for part in segment.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    order_ids.add(int(part))
+                except ValueError:
+                    continue
+    return sorted(order_ids)
+
+
+@AgentTool(
+    name="comorag_ask_book",
+    description=(
+        "使用 ComoRAG 根据问题对一本书的内容进行检索。"
+        "当用户提到剧情细节、角色关系、时间线、证据链、凶手推理等书内问题时优先调用。"
+        "参数必须包含 book_id 与 question。若 return_chunks=true，将返回命中的 chunk order_id 列表，"
+        "便于在你需要时继续调用 get_book_chunk_by_order 拉取原文。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "book_id": {
+                "type": "integer",
+                "description": "书籍 ID",
+            },
+            "question": {
+                "type": "string",
+                "description": "要问这本书的问题，建议完整自然语言。",
+            },
+            "return_chunks": {
+                "type": "boolean",
+                "description": "是否返回命中的 chunk order_id 列表。默认 false。",
+            },
+        },
+        "required": ["book_id", "question"],
+    },
+)
+def comorag_ask_book(book_id: int, question: str, return_chunks: bool = False):
+    try:
+        result = comorag_service.ask_book(book_id=int(book_id), question=question)
+        if result.get("status") != "success":
+            return json.dumps(result, ensure_ascii=False)
+
+        # Keep payload concise for tool-call context window.
+        condensed = {
+            "status": "success",
+            "book_id": result.get("book_id"),
+            "question": result.get("question"),
+            "answer": result.get("answer"),
+            "evidence_preview": (result.get("docs") or "")[:2400],
+            "summary_preview": (result.get("summary") or "")[:1600],
+            "timeline_preview": (result.get("timeline") or "")[:1600],
+            "index": result.get("index"),
+        }
+        if return_chunks:
+            matched_order_ids = _extract_order_ids_from_rag_fields(
+                result.get("docs"),
+                result.get("summary"),
+                result.get("timeline"),
+            )
+            condensed["matched_order_ids"] = matched_order_ids
+            condensed["matched_order_count"] = len(matched_order_ids)
+        return json.dumps(condensed, ensure_ascii=False)
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("comorag_ask_book failed")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@AgentTool(
+    name="get_book_chunk_by_order",
+    description=(
+        "按 book_id + order_id 获取原始 chunk 文本，其中 order_id 对应 chunk_index。相邻chunk文本的order_id是连续的。"
+        "你可以通过此工具阅读书籍原文片段"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "book_id": {
+                "type": "integer",
+                "description": "书籍 ID",
+            },
+            "order_id": {
+                "type": "integer",
+                "description": "chunk 顺序号（即 chunk_index，从 0 开始）",
+            },
+        },
+        "required": ["book_id", "order_id"],
+    },
+)
+def get_book_chunk_by_order(book_id: int, order_id: int):
+    try:
+        row = comorag_service.get_chunk_by_order(book_id=int(book_id), order_id=int(order_id))
+        if not row:
+            return json.dumps(
+                {
+                    "status": "empty",
+                    "message": "Chunk not found for this book/order_id",
+                    "book_id": int(book_id),
+                    "order_id": int(order_id),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "status": "success",
+                "book_id": int(book_id),
+                "order_id": int(order_id),
+                "chunk_id": row.get("hash_id"),
+                "text": row.get("content"),
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("get_book_chunk_by_order failed")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
 __all__ = [
     "get_book_cover",
     "search_books",
@@ -439,4 +574,6 @@ __all__ = [
     "get_books_by_rating",
     "get_book_chapters",
     "read_book_chapter",
+    "comorag_ask_book",
+    "get_book_chunk_by_order",
 ]

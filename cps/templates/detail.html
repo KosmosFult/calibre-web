@@ -278,6 +278,28 @@
                         </p>
                     {% endif %}
                 </div>
+
+                <div class="comorag-index-panel panel panel-default" style="margin-top: 12px;">
+                    <div class="panel-heading">
+                        <strong>ComoRAG Index</strong>
+                    </div>
+                    <div class="panel-body">
+                        <input type="hidden" id="comorag_csrf_token" name="csrf_token" value="{{ csrf_token() }}">
+                        <p id="comorag-index-status-text" class="text-muted" style="margin-bottom: 10px;">
+                            正在读取索引状态...
+                        </p>
+                        <button id="comorag-build-index-btn" class="btn btn-sm btn-primary" type="button" disabled>
+                            构建索引
+                        </button>
+                        <span id="comorag-index-loading" class="text-muted" style="margin-left: 8px; display: none;">
+                            处理中...
+                        </span>
+                        <div id="comorag-index-phase" class="text-info" style="margin-top: 8px;"></div>
+                        <div id="comorag-index-log-box"
+                             style="margin-top: 8px; max-height: 180px; overflow-y: auto; background: #f8f8f8; padding: 8px; border-radius: 4px; font-size: 12px;">
+                        </div>
+                    </div>
+                </div>
             {% endif %}
 
 
@@ -372,6 +394,115 @@
 <script src="{{ url_for('static', filename='js/details.js') }}"></script>
 <script src="{{ url_for('static', filename='js/fullscreen.js') }}"></script>
 <script type="text/javascript">
+    (function() {
+        var statusEl = document.getElementById("comorag-index-status-text");
+        var buildBtn = document.getElementById("comorag-build-index-btn");
+        var loadingEl = document.getElementById("comorag-index-loading");
+        var phaseEl = document.getElementById("comorag-index-phase");
+        var logBoxEl = document.getElementById("comorag-index-log-box");
+        var csrfEl = document.getElementById("comorag_csrf_token");
+        if (!statusEl || !buildBtn || !loadingEl || !phaseEl || !logBoxEl || !csrfEl) {
+            return;
+        }
+
+        var statusUrl = "{{ url_for('ai.comorag_index_status', book_id=entry.id) }}";
+        var buildUrl = "{{ url_for('ai.comorag_build_index', book_id=entry.id) }}";
+
+        function setLoading(isLoading) {
+            loadingEl.style.display = isLoading ? "inline" : "none";
+        }
+
+        function renderLogs(logs) {
+            if (!logs || !logs.length) {
+                logBoxEl.textContent = "暂无任务日志";
+                return;
+            }
+            var lines = logs.map(function(item) {
+                var ts = item.created_at || "";
+                var phase = item.phase || "-";
+                var level = item.level || "INFO";
+                var message = item.message || "";
+                return "[" + ts + "][" + phase + "][" + level + "] " + message;
+            });
+            logBoxEl.textContent = lines.join("\n");
+            logBoxEl.scrollTop = logBoxEl.scrollHeight;
+        }
+
+        function updateStatusView(data) {
+            if (!data || data.status === "error") {
+                statusEl.textContent = "索引状态读取失败: " + ((data && data.message) || "unknown error");
+                phaseEl.textContent = "";
+                renderLogs([]);
+                buildBtn.disabled = false;
+                return;
+            }
+            var indexed = !!data.indexed;
+            var indexedChunks = Number(data.indexed_chunks || 0);
+            var totalChunks = Number(data.total_chunks || 0);
+            var running = data.status === "running" || (data.job && (data.job.status === "RUNNING" || data.job.status === "QUEUED"));
+            if (running) {
+                statusEl.textContent = "索引任务进行中 (" + indexedChunks + "/" + totalChunks + " chunks)";
+                buildBtn.textContent = (data.job && data.job.status === "QUEUED") ? "排队中..." : "构建中...";
+                buildBtn.disabled = true;
+            } else if (indexed) {
+                statusEl.textContent = "已构建索引 (" + indexedChunks + "/" + totalChunks + " chunks)";
+                buildBtn.textContent = "重建索引";
+                buildBtn.disabled = false;
+            } else {
+                statusEl.textContent = "未完成索引 (" + indexedChunks + "/" + totalChunks + " chunks)";
+                buildBtn.textContent = "构建索引";
+                buildBtn.disabled = false;
+            }
+            var phase = data.job && data.job.phase ? data.job.phase : "-";
+            var message = data.job && data.job.message ? data.job.message : "";
+            phaseEl.textContent = "阶段: " + phase + (message ? " | " + message : "");
+            renderLogs(data.logs || []);
+        }
+
+        function fetchStatus() {
+            setLoading(false);
+            $.getJSON(statusUrl)
+                .done(function(resp) {
+                    updateStatusView(resp);
+                })
+                .fail(function(xhr) {
+                    var msg = "请求失败";
+                    if (xhr && xhr.responseJSON && xhr.responseJSON.message) {
+                        msg = xhr.responseJSON.message;
+                    }
+                    updateStatusView({status: "error", message: msg});
+                })
+                .always(function() {
+                });
+        }
+
+        buildBtn.addEventListener("click", function() {
+            setLoading(true);
+            $.ajax({
+                url: buildUrl,
+                method: "POST",
+                dataType: "json",
+                data: {csrf_token: csrfEl.value}
+            })
+            .done(function(resp) {
+                updateStatusView(resp);
+            })
+            .fail(function(xhr) {
+                var msg = "构建失败";
+                if (xhr && xhr.responseJSON && xhr.responseJSON.message) {
+                    msg = xhr.responseJSON.message;
+                }
+                updateStatusView({status: "error", message: msg});
+            })
+            .always(function() {
+                setLoading(false);
+                fetchStatus();
+            });
+        });
+
+        fetchStatus();
+        setInterval(fetchStatus, 3000);
+    })();
 </script>
 
 {% endblock %}

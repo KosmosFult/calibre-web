@@ -6,6 +6,8 @@ import json
 import os
 from .agent import CalibreAgent
 from . import ai_db
+from .config_loader import get_yaml_loader
+from .comorag import service as comorag_service
 
 ai = Blueprint('ai', __name__, url_prefix='/ai')
 
@@ -16,20 +18,32 @@ def get_agent():
     """
     获取 Agent 实例（不带历史，历史由调用方注入）
     """
+    loader = get_yaml_loader()
+    yaml_api_key = loader.get("ai", "genai", "api_key")
+    yaml_base_url = loader.get("ai", "genai", "base_url")
+    yaml_model = loader.get("ai", "genai", "model")
+    yaml_system_prompt = loader.get("ai", "genai", "system_prompt")
+    yaml_enable_search = loader.get("ai", "genai", "enable_search")
+
     api_key = (
-        os.environ.get("GEMINI_API_KEY")
+        yaml_api_key
+        or os.environ.get("GEMINI_API_KEY")
         or os.environ.get("GOOGLE_API_KEY")
         or os.environ.get("GOOGLE_GENAI_API_KEY")
         or os.environ.get("OPENAI_API_KEY")
     )
     base_url = (
-        os.environ.get("GENAI_BASE_URL")
+        yaml_base_url
+        or os.environ.get("GENAI_BASE_URL")
         or os.environ.get("GOOGLE_GENAI_BASE_URL")
         or os.environ.get("GOOGLE_API_BASE_URL")
     )
-    model = os.environ.get("GENAI_MODEL")
-    system_prompt = os.environ.get("GENAI_SYSTEM_PROMPT")
-    enable_search = os.environ.get("GENAI_ENABLE_SEARCH", "").lower() in ["1", "true", "yes"]
+    model = yaml_model or os.environ.get("GENAI_MODEL")
+    system_prompt = yaml_system_prompt or os.environ.get("GENAI_SYSTEM_PROMPT")
+    if yaml_enable_search is None:
+        enable_search = os.environ.get("GENAI_ENABLE_SEARCH", "").lower() in ["1", "true", "yes"]
+    else:
+        enable_search = bool(yaml_enable_search)
 
     if not api_key:
         return None
@@ -128,6 +142,32 @@ def get_messages(session_id):
         return jsonify(visible_messages)
     finally:
         db_sess.close()
+
+
+@ai.route('/books/<int:book_id>/comorag/index-status', methods=['GET'])
+@login_required
+def comorag_index_status(book_id):
+    try:
+        status = comorag_service.get_index_status(book_id=int(book_id))
+        return jsonify(status)
+    except Exception as e:  # pylint: disable=broad-except
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@ai.route('/books/<int:book_id>/comorag/build-index', methods=['POST'])
+@login_required
+def comorag_build_index(book_id):
+    try:
+        force_raw = request.form.get("force") if request.form else None
+        force = str(force_raw).lower() in {"1", "true", "yes", "on"}
+        ok, payload = comorag_service.trigger_index_build(book_id=int(book_id), force=force)
+        if ok:
+            code = 202
+        else:
+            code = 409 if payload.get("status") == "running" else 500
+        return jsonify(payload), code
+    except Exception as e:  # pylint: disable=broad-except
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @ai.route('/chat', methods=['POST'])
 @login_required

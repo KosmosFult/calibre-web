@@ -161,6 +161,31 @@ advanced:
   # 信任的主机列表（逗号分隔）
   # trusted_hosts: "example.com,sub.example.com"
 
+# AI (Gemini Agent) 配置
+ai:
+  genai:
+    # 建议优先在环境变量配置密钥；若你希望集中管理，也可直接写在这里
+    # api_key: ""
+    # base_url: ""
+    model: "gemini-3-flash-preview"
+    # system_prompt: "自定义系统提示词"
+    enable_search: false
+
+# ComoRAG 配置
+comorag:
+  # 建议优先在环境变量配置密钥；若你希望集中管理，也可直接写在这里
+  # api_key: ""
+  base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  llm_model: "gemini-3.1-flash-lite-preview"
+  embedding_model: "gemini-embedding-2-preview"
+  need_cluster: true
+  openie_mode: "online" # online / offline
+  chunk_size: 800
+  chunk_overlap: 100
+  enable_contextual: false
+  # 可选：覆盖默认工作目录（支持相对项目根目录或绝对路径）
+  # runtime_dir: "cps/comorag/runtime"
+
 # 自定义配置（扩展用）
 # custom:
 #   your_feature_1: value1

@@ -143,7 +143,9 @@ class EmbeddingStore:
             hash_id = compute_mdhash_id(text, prefix=self.namespace + "-")
             nodes_dict[hash_id] = {'content': text}
             if source_order_ids is not None:
-                source_by_hash[hash_id] = source_order_ids[idx] or []
+                merged_source_orders = set(source_by_hash.get(hash_id, []))
+                merged_source_orders.update(source_order_ids[idx] or [])
+                source_by_hash[hash_id] = sorted(merged_source_orders)
 
         # Get all hash_ids from the input dictionary.
         all_hash_ids = list(nodes_dict.keys())

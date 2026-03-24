@@ -78,6 +78,13 @@ services:       # 外部服务
   goodreads: {...}
   google_books: {...}
 
+ai:             # Agent 大模型配置
+  genai: {...}
+
+comorag:        # ComoRAG 检索配置
+  llm_model: ...
+  embedding_model: ...
+
 converters:     # 转换工具路径
   calibre_path: /usr/bin/ebook-convert
 
@@ -204,6 +211,29 @@ rate_limit:
   enabled: true
   storage_uri: "redis://localhost:6379"
   storage_options: ""
+```
+
+### 10. AI / ComoRAG 配置
+
+```yaml
+ai:
+  genai:
+    # api_key: "your-api-key"
+    # base_url: ""
+    model: "gemini-3.1-flash-lite-preview"
+    enable_search: false
+
+comorag:
+  # api_key: "your-api-key"
+  # base_url: ""
+  llm_model: "gemini-3.1-flash-lite-preview"
+  embedding_model: "gemini-embedding-2-preview"
+  need_cluster: true
+  openie_mode: "online"
+  chunk_size: 800
+  chunk_overlap: 200
+  enable_contextual: false
+  # runtime_dir: "cps/comorag/runtime"
 ```
 
 ## 🌍 环境变量

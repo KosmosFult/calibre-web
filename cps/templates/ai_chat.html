@@ -30,6 +30,48 @@
         @keyframes blink {
             50% { opacity: 0; }
         }
+        .markdown-body pre {
+            background: #f3f4f6;
+            padding: 0.75rem;
+            border-radius: 0.5rem;
+            overflow-x: auto;
+        }
+        .markdown-body code {
+            background: #f3f4f6;
+            padding: 0.125rem 0.375rem;
+            border-radius: 0.375rem;
+            font-size: 0.875em;
+        }
+        .markdown-body pre code {
+            background: transparent;
+            padding: 0;
+        }
+        .markdown-body p,
+        .markdown-body ul,
+        .markdown-body ol,
+        .markdown-body blockquote,
+        .markdown-body h1,
+        .markdown-body h2,
+        .markdown-body h3,
+        .markdown-body h4,
+        .markdown-body h5,
+        .markdown-body h6 {
+            margin: 0.5rem 0;
+        }
+        .markdown-body ul,
+        .markdown-body ol {
+            padding-left: 1.25rem;
+        }
+        .markdown-body blockquote {
+            border-left: 3px solid #d1d5db;
+            padding-left: 0.75rem;
+            color: #4b5563;
+        }
+        .markdown-body a {
+            color: #2563eb;
+            text-decoration: underline;
+            word-break: break-word;
+        }
         [v-cloak] { display: none; }
     </style>
 </head>
@@ -117,14 +159,18 @@
                     <!-- User Message -->
                     <div v-if="msg.role === 'user'" class="flex justify-end">
                         <div class="bg-blue-500 text-white px-4 py-2 rounded-2xl rounded-tr-none max-w-[80%] shadow-sm">
-                            [[ msg.content ]]
+                            <div class="markdown-body prose prose-sm max-w-none prose-invert" v-html="renderMarkdown(msg.content)"></div>
                         </div>
                     </div>
 
                     <!-- AI Message -->
                     <div v-else-if="msg.role === 'assistant' || msg.role === 'ai'" class="flex justify-start">
                         <div class="bg-white border border-gray-200 text-gray-800 px-4 py-2 rounded-2xl rounded-tl-none max-w-[80%] shadow-sm">
-                            <div class="prose prose-sm max-w-none whitespace-pre-wrap" :class="{ 'typing-cursor': msg.streaming }">[[ msg.content ]]</div>
+                            <div
+                                class="prose prose-sm max-w-none markdown-body"
+                                :class="{ 'typing-cursor': msg.streaming }"
+                                v-html="renderMarkdown(msg.content)"
+                            ></div>
                         </div>
                     </div>
                     
@@ -194,6 +240,157 @@
                     await nextTick()
                     if (chatContainer.value) {
                         chatContainer.value.scrollTop = chatContainer.value.scrollHeight
+                    }
+                }
+
+                const escapeHtml = (unsafe) => {
+                    return String(unsafe || '')
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#039;')
+                }
+
+                const applyInlineMarkdown = (escapedText) => {
+                    let text = String(escapedText || '')
+                    const codeTokens = []
+
+                    text = text.replace(/`([^`\n]+)`/g, (match, code) => {
+                        const token = codeTokens.push(`<code>${code}</code>`) - 1
+                        return `@@CODE_${token}@@`
+                    })
+
+                    text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (match, label, url) => {
+                        return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`
+                    })
+
+                    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+                    text = text.replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+                    text = text.replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
+
+                    text = text.replace(/@@CODE_(\d+)@@/g, (match, index) => {
+                        return codeTokens[Number(index)] || ''
+                    })
+
+                    return text
+                }
+
+                const flushParagraph = (output, lines) => {
+                    if (!lines.length) return
+                    const merged = lines.join('<br>')
+                    output.push(`<p>${applyInlineMarkdown(merged)}</p>`)
+                    lines.length = 0
+                }
+
+                const flushList = (output, items, tag) => {
+                    if (!items.length) return
+                    output.push(`<${tag}>${items.map(item => `<li>${applyInlineMarkdown(item)}</li>`).join('')}</${tag}>`)
+                    items.length = 0
+                }
+
+                const flushQuote = (output, lines) => {
+                    if (!lines.length) return
+                    output.push(`<blockquote>${lines.map(line => applyInlineMarkdown(line)).join('<br>')}</blockquote>`)
+                    lines.length = 0
+                }
+
+                const renderMarkdown = (content) => {
+                    const text = String(content || '')
+                    if (!text) return ''
+
+                    try {
+                        const lines = text.replace(/\r\n/g, '\n').split('\n')
+                        const output = []
+                        const paragraphLines = []
+                        const ulItems = []
+                        const olItems = []
+                        const quoteLines = []
+                        const codeLines = []
+                        let inCodeBlock = false
+
+                        const flushAll = () => {
+                            flushParagraph(output, paragraphLines)
+                            flushList(output, ulItems, 'ul')
+                            flushList(output, olItems, 'ol')
+                            flushQuote(output, quoteLines)
+                        }
+
+                        for (const rawLine of lines) {
+                            if (/^```/.test(rawLine)) {
+                                if (inCodeBlock) {
+                                    output.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
+                                    codeLines.length = 0
+                                    inCodeBlock = false
+                                } else {
+                                    flushAll()
+                                    inCodeBlock = true
+                                }
+                                continue
+                            }
+
+                            if (inCodeBlock) {
+                                codeLines.push(rawLine)
+                                continue
+                            }
+
+                            const line = escapeHtml(rawLine)
+                            const trimmed = line.trim()
+
+                            if (!trimmed) {
+                                flushAll()
+                                continue
+                            }
+
+                            const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/)
+                            if (headingMatch) {
+                                flushAll()
+                                const level = headingMatch[1].length
+                                output.push(`<h${level}>${applyInlineMarkdown(headingMatch[2])}</h${level}>`)
+                                continue
+                            }
+
+                            const quoteMatch = trimmed.match(/^&gt;\s?(.*)$/)
+                            if (quoteMatch) {
+                                flushParagraph(output, paragraphLines)
+                                flushList(output, ulItems, 'ul')
+                                flushList(output, olItems, 'ol')
+                                quoteLines.push(quoteMatch[1])
+                                continue
+                            }
+
+                            const ulMatch = trimmed.match(/^[-*+]\s+(.*)$/)
+                            if (ulMatch) {
+                                flushParagraph(output, paragraphLines)
+                                flushQuote(output, quoteLines)
+                                flushList(output, olItems, 'ol')
+                                ulItems.push(ulMatch[1])
+                                continue
+                            }
+
+                            const olMatch = trimmed.match(/^\d+\.\s+(.*)$/)
+                            if (olMatch) {
+                                flushParagraph(output, paragraphLines)
+                                flushQuote(output, quoteLines)
+                                flushList(output, ulItems, 'ul')
+                                olItems.push(olMatch[1])
+                                continue
+                            }
+
+                            flushList(output, ulItems, 'ul')
+                            flushList(output, olItems, 'ol')
+                            flushQuote(output, quoteLines)
+                            paragraphLines.push(line)
+                        }
+
+                        if (inCodeBlock) {
+                            output.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`)
+                        }
+                        flushAll()
+                        return output.join('')
+                    } catch (error) {
+                        console.error('Markdown render error:', error)
+                        return escapeHtml(text).replace(/\n/g, '<br>')
                     }
                 }
 
@@ -347,6 +544,7 @@
                     currentSessionTitle,
                     chatContainer,
                     formatDate,
+                    renderMarkdown,
                     createNewSession,
                     selectSession,
                     deleteSession,

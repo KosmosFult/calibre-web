@@ -1381,6 +1381,11 @@ class ComoRAG:
         temp_clusters_dir = os.path.join(self.working_dir, "temp_clusters")
         if source_order_ids is None:
             source_order_ids = [[idx] for idx in range(len(texts))]
+        if len(source_order_ids) != len(texts):
+            raise ValueError(
+                f"_recursive_clustering input mismatch: texts={len(texts)} "
+                f"source_order_ids={len(source_order_ids)}"
+            )
         
         # Define cleanup function
         def cleanup_temp_folders():
@@ -1402,7 +1407,9 @@ class ComoRAG:
             
         if current_iteration >= max_iterations:
             cleanup_temp_folders()
-            return texts, [texts[0]], [source_order_ids[0] if source_order_ids else []]
+            # `texts` is returned as the accumulated summaries for this level,
+            # so source_order_ids must stay aligned 1:1 with `texts`.
+            return texts, [texts[0]], source_order_ids
         
         try:
             temp_embedding_store = EmbeddingStore(
@@ -1415,10 +1422,11 @@ class ComoRAG:
             
             temp_embedding_store.insert_strings(texts)
             text_hash_ids = [compute_mdhash_id(text, prefix=temp_embedding_store.namespace + "-") for text in texts]
-            hash_to_source_orders = {
-                hash_id: sorted(set(source_order_ids[idx]))
-                for idx, hash_id in enumerate(text_hash_ids)
-            }
+            hash_to_source_orders = {}
+            for idx, hash_id in enumerate(text_hash_ids):
+                merged_source_orders = set(hash_to_source_orders.get(hash_id, []))
+                merged_source_orders.update(source_order_ids[idx] or [])
+                hash_to_source_orders[hash_id] = sorted(merged_source_orders)
             
             clustering = ChunkSoftClustering(
                 embedding_store=temp_embedding_store,
@@ -1438,8 +1446,7 @@ class ComoRAG:
             stats = clustering.get_cluster_stats()
             print(f"Clustering stats: {stats}")
             
-            summary_texts = []
-            summary_source_orders = []
+            cluster_results = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(32, len(clusters))) as executor:
                 future_to_cluster = {
                     executor.submit(clustering.create_cluster_summary, cluster.id): cluster 
@@ -1450,14 +1457,24 @@ class ComoRAG:
                     try:
                         summary = future.result()
                         if summary:  
-                            summary_texts.append(summary)
                             cluster = future_to_cluster[future]
                             cluster_source_orders = set()
                             for member_hash_id in cluster.members.keys():
                                 cluster_source_orders.update(hash_to_source_orders.get(member_hash_id, []))
-                            summary_source_orders.append(sorted(cluster_source_orders))
+                            cluster_results.append(
+                                (cluster.id, summary, sorted(cluster_source_orders))
+                            )
                     except Exception as e:
                         logger.error(f"error: {str(e)}")
+
+            cluster_results.sort(key=lambda item: item[0])
+            summary_texts = [item[1] for item in cluster_results]
+            summary_source_orders = [item[2] for item in cluster_results]
+            if len(summary_texts) != len(summary_source_orders):
+                raise ValueError(
+                    f"_recursive_clustering output mismatch: summaries={len(summary_texts)} "
+                    f"source_order_ids={len(summary_source_orders)}"
+                )
             
             # Clean up temporary folders for current level
             cleanup_temp_folders()

@@ -32,7 +32,7 @@ class EmbeddingStore:
         "misc": "emb_misc",
     }
 
-    def __init__(self, embedding_model, db_filename, batch_size, namespace):
+    def __init__(self, embedding_model, db_filename, batch_size, namespace, book_id: int):
         """
         Initializes the class with necessary configurations and sets up the working directory.
 
@@ -52,6 +52,7 @@ class EmbeddingStore:
         self.embedding_model = embedding_model
         self.batch_size = batch_size
         self.namespace = namespace
+        self.book_id = int(book_id)
         self.embedding_type = self._resolve_embedding_type(namespace)
         self.meta_table = self.TYPE_TO_META_TABLE[self.embedding_type]
         self.vector_table_name = self.TYPE_TO_VECTOR_TABLE[self.embedding_type]
@@ -166,6 +167,7 @@ class EmbeddingStore:
                 f"""
                 CREATE TABLE IF NOT EXISTS {self.meta_table} (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    book_id INTEGER NOT NULL,
                     namespace TEXT NOT NULL,
                     hash_id TEXT NOT NULL,
                     content TEXT NOT NULL,
@@ -174,14 +176,14 @@ class EmbeddingStore:
                     order_index INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(namespace, hash_id)
+                    UNIQUE(book_id, hash_id)
                 )
                 """
             )
             cur.execute(
                 f"""
-                CREATE INDEX IF NOT EXISTS idx_{self.meta_table}_namespace_order
-                ON {self.meta_table}(namespace, order_index)
+                CREATE INDEX IF NOT EXISTS idx_{self.meta_table}_book_namespace_order
+                ON {self.meta_table}(book_id, namespace, order_index)
                 """
             )
             conn.commit()
@@ -197,10 +199,10 @@ class EmbeddingStore:
                 f"""
                 SELECT hash_id, content, embedding
                 FROM {self.meta_table}
-                WHERE namespace = ?
+                WHERE book_id = ? AND namespace = ?
                 ORDER BY order_index ASC
                 """,
-                (self.namespace,),
+                (self.book_id, self.namespace),
             )
             rows = cur.fetchall()
 
@@ -250,8 +252,8 @@ class EmbeddingStore:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute(
-                f"SELECT COALESCE(MAX(order_index), -1) FROM {self.meta_table} WHERE namespace = ?",
-                (self.namespace,),
+                f"SELECT COALESCE(MAX(order_index), -1) FROM {self.meta_table} WHERE book_id = ? AND namespace = ?",
+                (self.book_id, self.namespace),
             )
             base_order = cur.fetchone()[0] + 1
             for idx, (hash_id, text, embedding) in enumerate(zip(hash_ids, texts, embeddings)):
@@ -260,10 +262,11 @@ class EmbeddingStore:
                 cur.execute(
                     f"""
                     INSERT OR REPLACE INTO {self.meta_table}
-                    (namespace, hash_id, content, embedding, embedding_dim, order_index, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (book_id, namespace, hash_id, content, embedding, embedding_dim, order_index, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
+                        self.book_id,
                         self.namespace,
                         hash_id,
                         text,
@@ -299,6 +302,7 @@ class EmbeddingStore:
             emb_arr = np.asarray(emb, dtype=np.float32)
             records.append(
                 {
+                    "book_id": self.book_id,
                     "namespace": self.namespace,
                     "hash_id": hash_id,
                     "content": text,
@@ -361,11 +365,11 @@ class EmbeddingStore:
                     continue
                 if prefix:
                     cur.execute(
-                        f"SELECT DISTINCT namespace FROM {table_name} WHERE namespace LIKE ?",
-                        (f"{prefix}%",),
+                        f"SELECT DISTINCT namespace FROM {table_name} WHERE book_id = ? AND namespace LIKE ?",
+                        (self.book_id, f"{prefix}%"),
                     )
                 else:
-                    cur.execute(f"SELECT DISTINCT namespace FROM {table_name}")
+                    cur.execute(f"SELECT DISTINCT namespace FROM {table_name} WHERE book_id = ?", (self.book_id,))
                 rows = cur.fetchall()
                 for row in rows:
                     seen.add(row[0])
@@ -383,14 +387,23 @@ class EmbeddingStore:
         try:
             search = table.search(query_list).metric("cosine")
             try:
-                search = search.where(f"namespace = '{self.namespace}'")
+                search = search.where(f"book_id = {self.book_id} AND namespace = '{self.namespace}'")
             except Exception:
                 pass
             rows = search.limit(int(top_k)).to_list()
         except Exception:
             # Compatibility fallback for LanceDB versions with different search API.
             rows = table.search(query_list).limit(int(top_k)).to_list()
-        return [row for row in rows if row.get("namespace") == self.namespace]
+        def same_book(row):
+            try:
+                return int(row.get("book_id", -1)) == self.book_id
+            except (TypeError, ValueError):
+                return False
+        return [
+            row
+            for row in rows
+            if row.get("namespace") == self.namespace and same_book(row)
+        ]
 
     @staticmethod
     def _row_to_similarity(row: Dict[str, Any]) -> float:

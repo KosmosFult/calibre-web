@@ -67,13 +67,19 @@ class ComoRAG:
         if embedding_base_url is not None:
             self.global_config.embedding_base_url = embedding_base_url
 
-        self.book_id = book_id
+        if book_id is None:
+            raise ValueError("ComoRAG requires a non-null book_id")
+        self.book_id = int(book_id)
 
         _print_config = ",\n  ".join([f"{k} = {v}" for k, v in asdict(self.global_config).items()])
         logger.debug(f"ComoRAG init with config:\n  {_print_config}\n")
         llm_label = self.global_config.llm_name.replace("/", "_")
         embedding_label = self.global_config.embedding_model_name.replace("/", "_")
-        self.working_dir = os.path.join(self.global_config.save_dir, f"{llm_label}_{embedding_label}")
+        self.working_dir = os.path.join(
+            self.global_config.save_dir,
+            f"book_{self.book_id}",
+            f"{llm_label}_{embedding_label}",
+        )
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory: {self.working_dir}")
             os.makedirs(self.working_dir, exist_ok=True)
@@ -95,15 +101,18 @@ class ComoRAG:
                                                                               embedding_model_name=self.global_config.embedding_model_name)
         self.ver_embedding_store = EmbeddingStore(self.embedding_model,
                                                     os.path.join(self.working_dir, "chunk_embeddings"),
-                                                    self.global_config.embedding_batch_size, 'chunk')
+                                                    self.global_config.embedding_batch_size, 'chunk', self.book_id)
         self.entity_embedding_store = EmbeddingStore(self.embedding_model,
                                                      os.path.join(self.working_dir, "entity_embeddings"),
-                                                     self.global_config.embedding_batch_size, 'entity')
+                                                     self.global_config.embedding_batch_size, 'entity', self.book_id)
         self.fact_embedding_store = EmbeddingStore(self.embedding_model,
                                                    os.path.join(self.working_dir, "fact_embeddings"),
-                                                   self.global_config.embedding_batch_size, 'fact')
+                                                   self.global_config.embedding_batch_size, 'fact', self.book_id)
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
-        self.openie_results_path = os.path.join(self.global_config.save_dir,f'openie_results_ner_{self.global_config.llm_name.replace("/", "_")}.json')
+        self.openie_results_path = os.path.join(
+            self.global_config.save_dir,
+            f"openie_results_book_{self.book_id}_ner_{self.global_config.llm_name.replace('/', '_')}.json",
+        )
         self.rerank_filter = DSPyFilter(self)
         self.ready_to_retrieve = False
         self.flag_cluster = False
@@ -151,6 +160,7 @@ class ComoRAG:
                 os.path.join(self.working_dir, "summary_embeddings"),
                 self.global_config.embedding_batch_size,
                 'summary',
+                self.book_id,
             )
         if self.epi_embedding_store is None:
             self.epi_embedding_store = EmbeddingStore(
@@ -158,6 +168,7 @@ class ComoRAG:
                 os.path.join(self.working_dir, "timeline_embeddings"),
                 self.global_config.embedding_batch_size,
                 'timeline',
+                self.book_id,
             )
 
         self.flag_cluster = bool(self.sem_embedding_store.get_all_ids())
@@ -173,6 +184,7 @@ class ComoRAG:
                 chunk_embedding_store=self.ver_embedding_store,
                 summary_embedding_store=self.epi_embedding_store,
                 summarization_model=self.summarization_model,
+                book_id=self.book_id,
             )
         if self.clustering is None and not self.flag_cluster:
             self.clustering = ChunkSoftClustering(
@@ -373,7 +385,7 @@ class ComoRAG:
                 else:
                     qa_message = self.prompt_template_manager.render(name=f'rag_qa_mc_memory', prompt_user=prompt_user)
             else:
-                qa_message = self.prompt_template_manager.render(name=f'rag_qa_narrativeqa', prompt_user=prompt_user)
+                qa_message = self.prompt_template_manager.render(name=f'rag_qa_narrativeqa_zh', prompt_user=prompt_user)
                 
             result = self.llm_model.infer(qa_message)
             # try:
@@ -391,7 +403,7 @@ class ComoRAG:
                 continue
                 
             try:
-                pred_ans = response_content.split('### Final Answer')[1].strip()
+                pred_ans = response_content.split('### <Final>')[1].strip()
             except IndexError:
                 logger.error("Response does not contain '### Final Answer' section")
                 pred_ans = response_content
@@ -400,7 +412,7 @@ class ComoRAG:
             step_info["response"] = response_content
             step_info["predicted_answer"] = pred_ans
             step_answers_local[f'step{i}'] = pred_ans
-            if pred_ans.strip() == "*":
+            if pred_ans.strip() == "*" or pred_ans.strip() == "<continue>" or '<continue>' in pred_ans.strip():
                 memory_pool.merge_temp_to_main()
                 # self-probe
                 previous_probes = "\n".join(memory_pool.get_all_probes())
@@ -1232,6 +1244,8 @@ class ComoRAG:
         candidate_fact_indices = [
             self.fact_id_to_idx[fid] for fid in candidate_fact_ids if fid in self.fact_id_to_idx
         ]
+
+        # 这里很迷惑，应该直接就是candidate_fact_ids
         real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
         fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
         candidate_facts = [eval(fact_row_dict[id]['content']) for id in real_candidate_fact_ids]
@@ -1302,7 +1316,8 @@ class ComoRAG:
                 self.embedding_model,
                 temp_embeddings_dir,
                 self.global_config.embedding_batch_size,
-                'temp'
+                'temp',
+                self.book_id,
             )
             
             temp_embedding_store.insert_strings(texts)

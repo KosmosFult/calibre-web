@@ -30,14 +30,38 @@ rag_qa_system = (
     4. Add your final answer at the end in the format "### Final Answer." Provide the shortest possible answer that is supported by the text. If there isn’t enough information in the content to provide a confident or definite answer, simply write "*".
     '''
 )
+# Historical compact-answer version (kept for reference):
+# rag_qa_system = (
+#     '''
+#     ### Role
+#     You are an expert at carefully reading complex texts, extracting narrative details, and making logical inferences.
+#
+#     ### Task
+#     Given the following detail article from a book, and a related question, you need to provide a accurate answer based on the given information.Use the shortest possible answer taken from the text.
+#
+#     ### Detail Article
+#     {context}
+#
+#     ### question
+#     {question}
+#
+#     ### Response Format
+#     0. All numbers must be written in English words for example twenty-three instead of twenty-three. Do not output approximations inequalities or ranges Give an exact answer from the text if available
+#     1. Start with a very brief understanding of the content in no more than two sentences. Begin this section with "### Content Understanding"
+#     2. Identify and analyze all plausibly relevant information from the content. Use a short markdown list. Avoid adding anything not in the text. Begin this section with "### Relevant Information Analysis"
+#     3. From that, extract only the key facts that directly answer the question. Use a concise markdown list. Begin this section with "### Key Facts"
+#     4. Add your final answer in the format "### Final Answer." Use the shortest possible answer taken from the text. If there isn’t enough information, just write "*"
+#     '''
+# )
+
 rag_qa_system = (
     '''
     ### Role
     You are an expert at carefully reading complex texts, extracting narrative details, and making logical inferences.
-    
+
     ### Task
-    Given the following detail article from a book, and a related question, you need to provide a accurate answer based on the given information.Use the shortest possible answer taken from the text. 
-    
+    Given the following detail article from a book and a related question, provide a natural and accurate answer based only on the given information.
+
     ### Detail Article
     {context}
 
@@ -45,11 +69,10 @@ rag_qa_system = (
     {question}
 
     ### Response Format
-    0. All numbers must be written in English words for example twenty-three instead of twenty-three. Do not output approximations inequalities or ranges Give an exact answer from the text if available
-    1. Start with a very brief understanding of the content in no more than two sentences. Begin this section with "### Content Understanding"
-    2. Identify and analyze all plausibly relevant information from the content. Use a short markdown list. Avoid adding anything not in the text. Begin this section with "### Relevant Information Analysis"
-    3. From that, extract only the key facts that directly answer the question. Use a concise markdown list. Begin this section with "### Key Facts"
-    4. Add your final answer in the format "### Final Answer." Use the shortest possible answer taken from the text. If there isn’t enough information, just write "*"
+    1. Start with a brief understanding of the content in no more than three sentences. Begin this section with "### Content Understanding"
+    2. Identify all plausibly relevant information from the content. Use a markdown list. Do not add information not supported by the text. Begin this section with "### Relevant Information Analysis"
+    3. Extract the key facts that directly support the answer. Use a concise markdown list. Begin this section with "### Key Facts"
+    4. Add your final answer in the format "### <Final>" Answer naturally and directly based on evidence. If there is not enough evidence, write "*".
     '''
 )
 
@@ -77,7 +100,7 @@ one_shot_rag_qa_output = (
     "- University of Southampton founding date: 1862\n"
     "- University of Southampton received Royal Charter: 1952\n\n"
     
-    "### Final Answer\n"
+    "### <Final>\n"
     "1862."
 )
 

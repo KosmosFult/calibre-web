@@ -17,6 +17,7 @@ class TimelineSummarizer:
         chunk_embedding_store,
         summary_embedding_store,
         summarization_model: BaseSummarizationModel,
+        book_id: int,
         window_size: Optional[int] = None,
         max_workers: int = 8
     ):
@@ -33,6 +34,7 @@ class TimelineSummarizer:
         self.chunk_store = chunk_embedding_store
         self.summary_store = summary_embedding_store
         self.summarization_model = summarization_model
+        self.book_id = int(book_id)
         self.max_workers = max_workers
         self.encoding = tiktoken.get_encoding("cl100k_base")  # Encoder used by GPT-4
         
@@ -338,7 +340,8 @@ Please provide a coherent summary that ensures:
             embedding_model=self.summary_store.embedding_model,
             db_filename=os.path.dirname(self.summary_store.filename),
             batch_size=self.summary_store.batch_size,
-            namespace="level_0"
+            namespace="level_0",
+            book_id=self.book_id,
         )
         level_store.insert_strings(level_summaries)
         
@@ -362,7 +365,8 @@ Please provide a coherent summary that ensures:
             embedding_model=self.summary_store.embedding_model,
             db_filename=os.path.dirname(self.summary_store.filename),
             batch_size=self.summary_store.batch_size,
-            namespace=f"level_{level}"
+            namespace=f"level_{level}",
+            book_id=self.book_id,
         )
         
         level_ids = level_store.get_all_ids()
@@ -386,7 +390,8 @@ Please provide a coherent summary that ensures:
             embedding_model=self.summary_store.embedding_model,
             db_filename=output_dir,
             batch_size=self.summary_store.batch_size,
-            namespace=f"level_{level}"
+            namespace=f"level_{level}",
+            book_id=self.book_id,
         )
 
     def load_and_validate_summaries(self, output_dir: str) -> bool:

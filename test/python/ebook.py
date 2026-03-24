@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from pathlib import Path
 
 import ebooklib
@@ -39,13 +40,13 @@ def build_smoke_docs():
     Use BookParser chunking logic without requiring Flask app context.
     We parse EPUB directly, then call parser internals to split into chunks.
     """
-    # epub_path = "/Users/kosmosfult/Documents/books/世界树之棺 - 筒城灯士郎.epub"
-    epub_path = "/Users/kosmosfult/Documents/books/永劫馆超连续杀人事件魔女决定与X赴死 ([日]南海游,译者李影恒) (z-library.sk, 1lib.sk, z-lib.sk).epub"
+    epub_path = "/Users/kosmosfult/Documents/books/世界树之棺 - 筒城灯士郎.epub"
+    # epub_path = "/Users/kosmosfult/Documents/books/永劫馆超连续杀人事件魔女决定与X赴死 ([日]南海游,译者李影恒) (z-library.sk, 1lib.sk, z-lib.sk).epub"
 
     parser = BookParser(chunk_size=800, chunk_overlap=200, enable_contextual=False)
     book = epub.read_epub(epub_path)
-    chapter_docs = parser._extract_chapters(book)[:9]
-    chunks = parser._chunk_chapters(book_id=99, chapters=chapter_docs)
+    chapter_docs = parser._extract_chapters(book)
+    chunks = parser._chunk_chapters(book_id=13, chapters=chapter_docs)
     return [chunk.text for chunk in chunks]
 
 
@@ -75,7 +76,7 @@ def build_smoke_docs():
 
 
 def build_query():
-    return "第二次轮回是怎么发生的"
+    return "爱埋公主线里的棺材里装的到底是不是帝国军人"
 
 
 def run_smoke_test():
@@ -101,6 +102,7 @@ def run_smoke_test():
     docs = build_smoke_docs()
 
     rag = ComoRAG(
+        book_id=13,
         llm_model_name=llm_model,
         llm_base_url=base_url,
         llm_api_key=api_key,
@@ -113,10 +115,15 @@ def run_smoke_test():
     rag.global_config.openie_mode = "online"
     rag.global_config.llm_provider = "google_genai"
     rag.global_config.embedding_provider = "google_genai"
+    rag.max_tokens_ver = 6000
+    rag.max_tokens_sem = 3000
+    rag.max_tokens_epi = 3000
 
     rag.index(docs)
 
+    try_answer_start = time.perf_counter()
     results = rag.try_answer([build_query()])
+    try_answer_elapsed = time.perf_counter() - try_answer_start
     if not results:
         raise RuntimeError("ComoRAG returned empty result list")
 
@@ -125,7 +132,9 @@ def run_smoke_test():
     print("Question:", first.question)
     print("Answer:", first.answer)
     print("Retrieved docs:", len(first.docs) if first.docs else 0)
+    return try_answer_elapsed
 
 
 if __name__ == "__main__":
-    run_smoke_test()
+    try_answer_elapsed = run_smoke_test()
+    print(f"try_answer elapsed: {try_answer_elapsed:.3f}s")

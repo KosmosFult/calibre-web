@@ -91,8 +91,6 @@ class ComoRAG:
         elif self.global_config.openie_mode == 'offline':
             self.openie = VLLMOfflineOpenIE(self.global_config)
 
-        self.graph = self.initialize_graph()
-
         if self.global_config.openie_mode == 'offline':
             self.embedding_model = None
         else:
@@ -108,12 +106,6 @@ class ComoRAG:
         self.fact_embedding_store = EmbeddingStore(self.embedding_model,
                                                    os.path.join(self.working_dir, "fact_embeddings"),
                                                    self.global_config.embedding_batch_size, 'fact', self.book_id)
-        self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
-        self.openie_results_path = os.path.join(
-            self.global_config.save_dir,
-            f"openie_results_book_{self.book_id}_ner_{self.global_config.llm_name.replace('/', '_')}.json",
-        )
-        self.rerank_filter = DSPyFilter(self)
         self.ready_to_retrieve = False
         self.flag_cluster = False
         self.sem_embedding_store = None
@@ -122,6 +114,15 @@ class ComoRAG:
         self.timeline_summarizer = None
         self.clustering = None
         self.level_store = None
+        self.node_to_node_stats = {}
+        self.ent_node_to_num_chunk = {}
+        self.graph = self.initialize_graph()
+        self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
+        self.openie_results_path = os.path.join(
+            self.global_config.save_dir,
+            f"openie_results_book_{self.book_id}_ner_{self.global_config.llm_name.replace('/', '_')}.json",
+        )
+        self.rerank_filter = DSPyFilter(self)
 
         self.steps = self.global_config.max_iterations
         self.max_tokens_ver = self.global_config.max_tokens_ver
@@ -272,12 +273,77 @@ class ComoRAG:
             preloaded_graph = ig.Graph.Read_GraphML(self._graphml_xml_file)
 
         if preloaded_graph is None:
-            return ig.Graph(directed=self.global_config.is_directed_graph)
+            graph = ig.Graph(directed=self.global_config.is_directed_graph)
         else:
             logger.info(
                 f"Loaded graph from {self._graphml_xml_file} with {preloaded_graph.vcount()} nodes, {preloaded_graph.ecount()} edges"
             )
-            return preloaded_graph
+            graph = preloaded_graph
+
+        self.graph = graph
+        self._restore_persisted_runtime_state()
+        return graph
+
+    def _restore_persisted_runtime_state(self):
+        """
+        Restore persisted retrieval/runtime structures after a fresh init or
+        after index mutations.
+
+        This should be the single place that reconciles persisted stores/graph
+        with in-memory runtime state required by retrieval.
+        """
+        self.node_to_node_stats = {}
+        self.ent_node_to_num_chunk = {}
+        self.ready_to_retrieve = False
+        self.query_to_embedding = {'triple': {}, 'passage': {}}
+        if self.sem_embedding_store is not None:
+            self.flag_cluster = bool(self.sem_embedding_store.get_all_ids())
+        self._restore_graph_runtime_state()
+
+    def _restore_graph_runtime_state(self):
+        """
+        Recover runtime-only graph statistics from persisted graph/store data.
+
+        `index()` builds `ent_node_to_num_chunk` in memory, but that structure is
+        not stored separately. When a fresh ComoRAG instance is created after the
+        index already exists, retrieval still needs this count map to normalize
+        entity weights during graph search.
+        """
+        if self.graph is None or self.graph.vcount() == 0:
+            return
+
+        graph_names = set(self.graph.vs["name"]) if "name" in self.graph.vs.attribute_names() else set()
+        if not graph_names:
+            return
+
+        passage_keys = set(self.ver_embedding_store.get_all_ids())
+        entity_keys = set(self.entity_embedding_store.get_all_ids())
+        if not passage_keys or not entity_keys:
+            return
+
+        valid_passage_keys = passage_keys.intersection(graph_names)
+        valid_entity_keys = entity_keys.intersection(graph_names)
+        if not valid_passage_keys or not valid_entity_keys:
+            return
+
+        vertex_index_by_name = {vertex["name"]: vertex.index for vertex in self.graph.vs}
+        for entity_key in valid_entity_keys:
+            entity_idx = vertex_index_by_name.get(entity_key)
+            if entity_idx is None:
+                continue
+            neighbor_indices = self.graph.neighbors(entity_idx, mode="all")
+            linked_passages = 0
+            for neighbor_idx in neighbor_indices:
+                neighbor_name = self.graph.vs[neighbor_idx]["name"]
+                if neighbor_name in valid_passage_keys:
+                    linked_passages += 1
+            self.ent_node_to_num_chunk[entity_key] = linked_passages
+
+        logger.info(
+            "Restored graph runtime state for book_id=%s: %s entity chunk counts",
+            self.book_id,
+            len(self.ent_node_to_num_chunk),
+        )
 
     def pre_openie(self,  docs: List[str]):
         logger.info(f"Indexing Documents")
@@ -388,6 +454,8 @@ class ComoRAG:
             self.add_synonymy_edges()
             self.augment_graph()
             self.save_igraph()
+
+        self._restore_persisted_runtime_state()
 
     def meta_control_loop(self, q_idx, query):
         """process single query"""

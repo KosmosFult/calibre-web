@@ -5,11 +5,13 @@ import threading
 import datetime
 import uuid
 import traceback
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from flask import has_app_context
 
 from .. import ai_db
+from ..ai_storage import get_comorag_runtime_dir
 from ..ai_search.chunking import BookParser
 from ..config_loader import get_yaml_loader
 from .ComoRAG import ComoRAG
@@ -21,6 +23,7 @@ log = logging.getLogger("calibre-web.ai")
 _RAG_CACHE: Dict[int, ComoRAG] = {}
 _BOOK_LOCKS: Dict[int, threading.Lock] = {}
 _CACHE_LOCK = threading.Lock()
+ORDER_ID_PATTERN = re.compile(r"\[order_id=([0-9,\s]+)\]")
 
 
 def _to_bool(value: Optional[str], default: bool = False) -> bool:
@@ -38,6 +41,40 @@ def _yaml_get(*keys, default=None):
 
 def _now_iso() -> str:
     return datetime.datetime.utcnow().isoformat()
+
+
+def _normalize_chapter_indices(chapter_indices: Optional[Any]) -> Optional[List[int]]:
+    if chapter_indices is None or chapter_indices == "":
+        return None
+    if isinstance(chapter_indices, str):
+        raw = chapter_indices.strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = [part.strip() for part in raw.split(",")]
+        chapter_indices = parsed
+    if isinstance(chapter_indices, (int, float)):
+        chapter_indices = [int(chapter_indices)]
+    if not isinstance(chapter_indices, (list, tuple, set)):
+        raise ValueError("chapter_indices must be a list of chapter indexes or a comma-separated string")
+
+    normalized = []
+    for value in chapter_indices:
+        if value is None or value == "":
+            continue
+        normalized.append(int(value))
+    return sorted(set(normalized)) or None
+
+
+def _chapter_scope_label(chapter_indices: Optional[List[int]]) -> str:
+    if not chapter_indices:
+        return "full book"
+    preview = ",".join(str(v) for v in chapter_indices[:10])
+    if len(chapter_indices) > 10:
+        preview += ",..."
+    return f"chapters[{preview}]"
 
 
 def _run_with_app_context(func, *args, **kwargs):
@@ -102,6 +139,14 @@ def _build_config() -> BaseConfig:
         default=True,
     )
     openie_mode = _yaml_get("comorag", "openie_mode") or os.environ.get("COMORAG_OPENIE_MODE") or "online"
+    embedding_normalize = _to_bool(
+        _yaml_get("comorag", "embedding_normalize", default=os.environ.get("COMORAG_EMBEDDING_NORMALIZE")),
+        default=True,
+    )
+    embedding_output_dim_raw = (
+        _yaml_get("comorag", "embedding_output_dim")
+        or os.environ.get("COMORAG_EMBEDDING_OUTPUT_DIM")
+    )
 
     cfg = BaseConfig()
     cfg.llm_name = llm_model
@@ -113,6 +158,8 @@ def _build_config() -> BaseConfig:
     cfg.embedding_api_key = api_key
     cfg.embedding_base_url = base_url
     cfg.embedding_provider = "google_genai"
+    cfg.embedding_return_as_normalized = embedding_normalize
+    cfg.embedding_output_dim = int(embedding_output_dim_raw) if embedding_output_dim_raw not in (None, "") else None
 
     cfg.need_cluster = need_cluster
     cfg.openie_mode = openie_mode
@@ -131,13 +178,7 @@ def _book_lock(book_id: int) -> threading.Lock:
 
 
 def _workspace_dir() -> str:
-    configured = _yaml_get("comorag", "runtime_dir") or os.environ.get("COMORAG_RUNTIME_DIR")
-    if configured:
-        if os.path.isabs(configured):
-            return configured
-        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
-        return os.path.abspath(os.path.join(base_dir, configured))
-    return os.path.join(os.path.dirname(__file__), "runtime")
+    return get_comorag_runtime_dir()
 
 
 def _connect_db():
@@ -343,7 +384,7 @@ def get_rag(book_id: int) -> ComoRAG:
     return rag
 
 
-def _build_docs_for_book(book_id: int) -> List[str]:
+def _build_chunk_rows_for_book(book_id: int, chapter_indices: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     parser = BookParser(
         chunk_size=int(_yaml_get("comorag", "chunk_size") or os.environ.get("COMORAG_CHUNK_SIZE", "800")),
         chunk_overlap=int(_yaml_get("comorag", "chunk_overlap") or os.environ.get("COMORAG_CHUNK_OVERLAP", "200")),
@@ -358,8 +399,12 @@ def _build_docs_for_book(book_id: int) -> List[str]:
     from ebooklib import epub
     book = epub.read_epub(file_path)
     chapter_docs = parser._extract_chapters(book)
+    normalized_indices = _normalize_chapter_indices(chapter_indices)
+    if normalized_indices is not None:
+        allowed = set(normalized_indices)
+        chapter_docs = [chapter for chapter in chapter_docs if int(chapter.get("index", -1)) in allowed]
     chunks = parser._chunk_chapters(book_id=int(book_id), chapters=chapter_docs)
-    return [chunk.text for chunk in chunks]
+    return [chunk.to_rag_row() for chunk in chunks]
 
 
 def _count_ver_indexed(book_id: int) -> int:
@@ -388,7 +433,8 @@ def _fetch_ver_row_by_order(book_id: int, order_id: int) -> Optional[Dict[str, A
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT hash_id, content, order_index
+            SELECT hash_id, content, order_index, chapter_id, chapter_index, chapter_title,
+                   chunk_index_in_chapter, word_count, char_count
             FROM ai_rag_meta_ver
             WHERE book_id = ? AND namespace = 'chunk' AND order_index = ?
             LIMIT 1
@@ -402,6 +448,12 @@ def _fetch_ver_row_by_order(book_id: int, order_id: int) -> Optional[Dict[str, A
             "hash_id": row[0],
             "content": row[1],
             "order_id": int(row[2]),
+            "chapter_id": row[3],
+            "chapter_index": row[4],
+            "chapter_title": row[5],
+            "chunk_index_in_chapter": row[6],
+            "word_count": int(row[7] or 0),
+            "char_count": int(row[8] or 0),
         }
     finally:
         conn.close()
@@ -409,6 +461,186 @@ def _fetch_ver_row_by_order(book_id: int, order_id: int) -> Optional[Dict[str, A
 
 def get_chunk_by_order(book_id: int, order_id: int) -> Optional[Dict[str, Any]]:
     return _fetch_ver_row_by_order(book_id=int(book_id), order_id=int(order_id))
+
+
+def get_chunks_by_order_range(book_id: int, start_order_id: int, limit: int = 3) -> List[Dict[str, Any]]:
+    conn = sqlite3.connect(ai_db.DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT hash_id, content, order_index, chapter_id, chapter_index, chapter_title,
+                   chunk_index_in_chapter, word_count, char_count
+            FROM ai_rag_meta_ver
+            WHERE book_id = ? AND namespace = 'chunk' AND order_index >= ?
+            ORDER BY order_index ASC
+            LIMIT ?
+            """,
+            (int(book_id), int(start_order_id), max(1, int(limit))),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return [
+        {
+            "hash_id": row[0],
+            "content": row[1],
+            "order_id": int(row[2]),
+            "chapter_id": row[3],
+            "chapter_index": row[4],
+            "chapter_title": row[5],
+            "chunk_index_in_chapter": row[6],
+            "word_count": int(row[7] or 0),
+            "char_count": int(row[8] or 0),
+        }
+        for row in rows
+    ]
+
+
+def get_chunk_window(book_id: int, center_order_id: int, before: int = 1, after: int = 1) -> List[Dict[str, Any]]:
+    start_order_id = max(0, int(center_order_id) - max(0, int(before)))
+    limit = max(1, int(before) + int(after) + 1)
+    rows = get_chunks_by_order_range(book_id=int(book_id), start_order_id=start_order_id, limit=limit)
+    end_order_id = int(center_order_id) + max(0, int(after))
+    return [row for row in rows if row["order_id"] <= end_order_id]
+
+
+def get_book_outline(book_id: int) -> Dict[str, Any]:
+    conn = sqlite3.connect(ai_db.DB_PATH)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT chapter_id, chapter_index, chapter_title, start_order_index, end_order_index,
+                   chunk_count, word_count, char_count
+            FROM ai_rag_chapters
+            WHERE book_id = ?
+            ORDER BY chapter_index ASC
+            """,
+            (int(book_id),),
+        )
+        chapter_rows = cur.fetchall()
+        cur.execute(
+            """
+            SELECT COUNT(1)
+            FROM ai_rag_meta_ver
+            WHERE book_id = ? AND namespace = 'chunk'
+            """,
+            (int(book_id),),
+        )
+        total_chunk_row = cur.fetchone()
+    finally:
+        conn.close()
+
+    chapters = [
+        {
+            "chapter_id": row[0],
+            "chapter_index": int(row[1]),
+            "chapter_title": row[2],
+            "start_order_id": int(row[3]),
+            "end_order_id": int(row[4]),
+            "chunk_count": int(row[5]),
+            "word_count": int(row[6] or 0),
+            "char_count": int(row[7] or 0),
+        }
+        for row in chapter_rows
+    ]
+    return {
+        "book_id": int(book_id),
+        "total_chunks": int(total_chunk_row[0] or 0) if total_chunk_row else 0,
+        "total_chapters": len(chapters),
+        "chapters": chapters,
+    }
+
+
+def get_chapter_chunks(
+    book_id: int,
+    chapter_index: int,
+    start_chunk_offset: int = 0,
+    limit_chunks: int = 5,
+) -> Dict[str, Any]:
+    outline = get_book_outline(book_id=int(book_id))
+    target_chapter = next(
+        (chapter for chapter in outline["chapters"] if chapter["chapter_index"] == int(chapter_index)),
+        None,
+    )
+    if not target_chapter:
+        return {"status": "empty", "message": "Chapter not found", "book_id": int(book_id), "chapter_index": int(chapter_index)}
+
+    start_order_id = target_chapter["start_order_id"] + max(0, int(start_chunk_offset))
+    rows = get_chunks_by_order_range(book_id=int(book_id), start_order_id=start_order_id, limit=max(1, int(limit_chunks)))
+    chapter_rows = [row for row in rows if row.get("chapter_index") == int(chapter_index)]
+    return {
+        "status": "success",
+        "book_id": int(book_id),
+        "chapter": target_chapter,
+        "chunks": chapter_rows,
+    }
+
+
+def _extract_order_ids_from_text(*fields: Optional[str]) -> List[int]:
+    order_ids = set()
+    for field in fields:
+        if not field:
+            continue
+        for segment in ORDER_ID_PATTERN.findall(str(field)):
+            for part in segment.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    order_ids.add(int(part))
+                except ValueError:
+                    continue
+    return sorted(order_ids)
+
+
+def _build_reading_windows(order_ids: List[int], padding: int = 1) -> List[Dict[str, int]]:
+    if not order_ids:
+        return []
+    windows = []
+    for order_id in sorted(set(int(v) for v in order_ids)):
+        start = max(0, order_id - max(0, int(padding)))
+        end = order_id + max(0, int(padding))
+        if windows and start <= windows[-1]["end_order_id"] + 1:
+            windows[-1]["end_order_id"] = max(windows[-1]["end_order_id"], end)
+        else:
+            windows.append({"start_order_id": start, "end_order_id": end})
+    return windows
+
+
+def _build_anchor_trace(book_id: int, order_ids: List[int]) -> List[Dict[str, Any]]:
+    anchors = []
+    for order_id in order_ids:
+        row = get_chunk_by_order(book_id=int(book_id), order_id=int(order_id))
+        if not row:
+            continue
+        excerpt = (row.get("content") or "").strip()
+        if len(excerpt) > 220:
+            excerpt = excerpt[:220].rstrip() + "..."
+        anchors.append(
+            {
+                "order_id": int(order_id),
+                "chapter_id": row.get("chapter_id"),
+                "chapter_index": row.get("chapter_index"),
+                "chapter_title": row.get("chapter_title"),
+                "chunk_index_in_chapter": row.get("chunk_index_in_chapter"),
+                "excerpt": excerpt,
+            }
+        )
+    return anchors
+
+
+def _build_reasoning_trace(book_id: int, answer_draft: str, docs: str, summary: str, timeline: str) -> Dict[str, Any]:
+    mentioned_order_ids = _extract_order_ids_from_text(answer_draft)
+    if not mentioned_order_ids:
+        mentioned_order_ids = _extract_order_ids_from_text(docs, summary, timeline)
+    return {
+        "mentioned_order_ids": mentioned_order_ids,
+        "reading_windows": _build_reading_windows(mentioned_order_ids, padding=1),
+        "anchors": _build_anchor_trace(book_id=int(book_id), order_ids=mentioned_order_ids),
+    }
 
 
 def get_index_status(book_id: int) -> Dict[str, Any]:
@@ -433,8 +665,11 @@ def _perform_index_build(
     run_id: str,
     force: bool = False,
     progress_callback: Optional[Callable[[str, str, float], None]] = None,
+    chapter_indices: Optional[List[int]] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     phase = "CHECK_EXISTING"
+    normalized_indices = _normalize_chapter_indices(chapter_indices)
+    scope_label = _chapter_scope_label(normalized_indices)
     try:
         existing = _count_ver_indexed(int(book_id))
         _notify_progress(progress_callback, phase, "Checking existing index", 0.10)
@@ -446,7 +681,7 @@ def _perform_index_build(
             message="Checking existing index",
             indexed_chunks=existing,
         )
-        _append_job_log(int(book_id), run_id, phase, "INFO", f"existing indexed chunks={existing}")
+        _append_job_log(int(book_id), run_id, phase, "INFO", f"existing indexed chunks={existing} scope={scope_label}")
 
         if existing > 0 and not force:
             _notify_progress(progress_callback, "DONE", "Index already exists", 1.0)
@@ -481,37 +716,37 @@ def _perform_index_build(
             )
             return False, {
                 "status": "error",
-                "message": "Index already exists; manually clear comorag tables before force rebuild.",
+                "message": f"Index already exists; manually clear comorag tables before force rebuild ({scope_label}).",
             }
 
         phase = "LOAD_SOURCE"
         _notify_progress(progress_callback, phase, "Loading source docs", 0.25)
-        _upsert_job(int(book_id), status="RUNNING", phase=phase, message="Loading source docs")
-        _append_job_log(int(book_id), run_id, phase, "INFO", "Start parsing source book")
-        docs = _build_docs_for_book(int(book_id))
-        if not docs:
+        _upsert_job(int(book_id), status="RUNNING", phase=phase, message=f"Loading source docs ({scope_label})")
+        _append_job_log(int(book_id), run_id, phase, "INFO", f"Start parsing source book scope={scope_label}")
+        chunk_rows = _build_chunk_rows_for_book(int(book_id), chapter_indices=normalized_indices)
+        if not chunk_rows:
             _notify_progress(progress_callback, "FAILED", "No readable docs available for this book", 1.0)
             _upsert_job(
                 int(book_id),
                 status="FAILED",
                 phase="FAILED",
-                message="No readable docs available for this book",
-                last_error="No readable docs available for this book",
+                message=f"No readable docs available for this book ({scope_label})",
+                last_error=f"No readable docs available for this book ({scope_label})",
                 finished_at=_now_iso(),
             )
-            _append_job_log(int(book_id), run_id, phase, "ERROR", "No readable docs available for this book")
-            return False, {"status": "error", "message": "No readable docs available for this book"}
+            _append_job_log(int(book_id), run_id, phase, "ERROR", f"No readable docs available for this book scope={scope_label}")
+            return False, {"status": "error", "message": f"No readable docs available for this book ({scope_label})"}
 
-        _notify_progress(progress_callback, phase, f"Loaded {len(docs)} chunks", 0.45)
-        _upsert_job(int(book_id), total_chunks=len(docs), message=f"Loaded {len(docs)} chunks")
-        _append_job_log(int(book_id), run_id, phase, "INFO", f"Loaded docs count={len(docs)}")
+        _notify_progress(progress_callback, phase, f"Loaded {len(chunk_rows)} chunks", 0.45)
+        _upsert_job(int(book_id), total_chunks=len(chunk_rows), message=f"Loaded {len(chunk_rows)} chunks ({scope_label})")
+        _append_job_log(int(book_id), run_id, phase, "INFO", f"Loaded docs count={len(chunk_rows)} scope={scope_label}")
 
         phase = "INDEXING"
         _notify_progress(progress_callback, phase, "Building index", 0.70)
-        _upsert_job(int(book_id), status="RUNNING", phase=phase, message="Building index")
-        _append_job_log(int(book_id), run_id, phase, "INFO", "Start ComoRAG.index(docs)")
+        _upsert_job(int(book_id), status="RUNNING", phase=phase, message=f"Building index ({scope_label})")
+        _append_job_log(int(book_id), run_id, phase, "INFO", f"Start ComoRAG.index(chunk_rows) scope={scope_label}")
         rag = get_rag(int(book_id))
-        rag.index(docs)
+        rag.index(chunk_rows)
 
         phase = "FINALIZE"
         _notify_progress(progress_callback, phase, "Finalizing index", 0.95)
@@ -520,14 +755,16 @@ def _perform_index_build(
             int(book_id),
             status="SUCCESS",
             phase="DONE",
-            message="Index build completed",
+            message=f"Index build completed ({scope_label})",
             indexed_chunks=current,
-            total_chunks=max(len(docs), current),
+            total_chunks=max(len(chunk_rows), current),
             finished_at=_now_iso(),
         )
         _notify_progress(progress_callback, "DONE", "Index build completed", 1.0)
-        _append_job_log(int(book_id), run_id, phase, "INFO", f"Index build completed, indexed={current}")
-        return True, get_index_status(int(book_id))
+        _append_job_log(int(book_id), run_id, phase, "INFO", f"Index build completed, indexed={current} scope={scope_label}")
+        payload = get_index_status(int(book_id))
+        payload["build_scope"] = {"chapter_indices": normalized_indices, "scope_label": scope_label}
+        return True, payload
     except Exception as exc:  # pylint: disable=broad-except
         err_msg = f"{exc}"
         _notify_progress(progress_callback, "FAILED", "Index build failed", 1.0)
@@ -541,10 +778,12 @@ def _perform_index_build(
         )
         _append_job_log(int(book_id), run_id, phase, "ERROR", err_msg)
         _append_job_log(int(book_id), run_id, "TRACEBACK", "ERROR", traceback.format_exc())
-        return False, {"status": "error", "message": err_msg}
+        return False, {"status": "error", "message": err_msg, "build_scope": {"chapter_indices": normalized_indices, "scope_label": scope_label}}
 
 
-def trigger_index_build(book_id: int, force: bool = False) -> Tuple[bool, Dict[str, Any]]:
+def trigger_index_build(book_id: int, force: bool = False, chapter_indices: Optional[List[int]] = None) -> Tuple[bool, Dict[str, Any]]:
+    normalized_indices = _normalize_chapter_indices(chapter_indices)
+    scope_label = _chapter_scope_label(normalized_indices)
     lock = _book_lock(int(book_id))
     with lock:
         _init_job_tables()
@@ -562,17 +801,17 @@ def trigger_index_build(book_id: int, force: bool = False) -> Tuple[bool, Dict[s
             run_id=run_id,
             status="QUEUED",
             phase="QUEUED",
-            message="Queued",
+            message=f"Queued ({scope_label})",
             last_error="",
             started_at=_now_iso(),
             finished_at="",
         )
-        _append_job_log(int(book_id), run_id, "QUEUED", "INFO", "Index build queued")
+        _append_job_log(int(book_id), run_id, "QUEUED", "INFO", f"Index build queued scope={scope_label}")
         from ..services.worker import WorkerThread
         from ..tasks.comorag_index import TaskComoRAGIndex
         WorkerThread.add(
             user="System",
-            task=TaskComoRAGIndex(book_id=int(book_id), run_id=run_id, force=force),
+            task=TaskComoRAGIndex(book_id=int(book_id), run_id=run_id, force=force, chapter_indices=normalized_indices),
             hidden=False,
         )
         return True, {
@@ -580,6 +819,7 @@ def trigger_index_build(book_id: int, force: bool = False) -> Tuple[bool, Dict[s
             "message": "Index build queued",
             "book_id": int(book_id),
             "run_id": run_id,
+            "build_scope": {"chapter_indices": normalized_indices, "scope_label": scope_label},
         }
 
 
@@ -629,13 +869,23 @@ def ask_book(book_id: int, question: str) -> Dict[str, Any]:
         }
 
     solution = results[0]
+    answer_draft = solution.answer
+    trace = _build_reasoning_trace(
+        book_id=int(book_id),
+        answer_draft=answer_draft,
+        docs=solution.docs,
+        summary=solution.summary,
+        timeline=solution.timeline,
+    )
     return {
         "status": "success",
         "book_id": int(book_id),
         "question": question,
-        "answer": solution.answer,
+        "answer": answer_draft,
+        "answer_draft": answer_draft,
         "docs": solution.docs,
         "summary": solution.summary,
         "timeline": solution.timeline,
+        "trace": trace,
         "index": index_info,
     }

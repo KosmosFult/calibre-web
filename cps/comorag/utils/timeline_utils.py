@@ -11,6 +11,18 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+
+def _build_token_counter():
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return lambda text: len(encoding.encode(text))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "Failed to initialize tiktoken cl100k_base, falling back to whitespace token counting: %s",
+            exc,
+        )
+        return lambda text: len((text or "").split())
+
 class TimelineSummarizer:
     def __init__(
         self,
@@ -36,7 +48,7 @@ class TimelineSummarizer:
         self.summarization_model = summarization_model
         self.book_id = int(book_id)
         self.max_workers = max_workers
-        self.encoding = tiktoken.get_encoding("cl100k_base")  # Encoder used by GPT-4
+        self._count_tokens_fn = _build_token_counter()
         
         # Calculate appropriate window size
         all_ids = self.chunk_store.get_all_ids()
@@ -70,7 +82,7 @@ class TimelineSummarizer:
         Returns:
             int: Number of tokens
         """
-        return len(self.encoding.encode(text))
+        return self._count_tokens_fn(text)
     
     def get_summary_statistics(self) -> Dict[str, Any]:
         """

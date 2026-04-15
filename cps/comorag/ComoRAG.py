@@ -345,11 +345,18 @@ class ComoRAG:
             len(self.ent_node_to_num_chunk),
         )
 
-    def pre_openie(self,  docs: List[str]):
+    def pre_openie(self, chunk_rows: List[Dict[str, Any]]):
         logger.info(f"Indexing Documents")
         logger.info(f"Performing OpenIE Offline")
-        
-        chunks = self.ver_embedding_store.get_missing_string_hash_ids(docs)
+
+        chunks = {
+            str(row["hash_id"]): {
+                "hash_id": str(row["hash_id"]),
+                "content": str(row["content"]),
+            }
+            for row in chunk_rows
+            if str(row.get("content") or "").strip()
+        }
 
         all_openie_info, chunk_keys_to_process = self.load_existing_openie(chunks.keys())
         new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
@@ -363,15 +370,37 @@ class ComoRAG:
 
         assert False, logger.info('Done with OpenIE, run online indexing for future retrieval.')
 
-    def index(self, docs: List[str]):
+    def index(self, docs: List[Union[str, Dict[str, Any]]]):
         logger.info(f"Indexing Documents")
+
+        normalized_chunk_rows: List[Dict[str, Any]] = []
+        for idx, item in enumerate(docs):
+            if isinstance(item, dict):
+                text = str(item.get("content") or item.get("text") or "").strip()
+                if not text:
+                    continue
+                row = dict(item)
+                row["content"] = text
+                row.setdefault("order_index", idx)
+                normalized_chunk_rows.append(row)
+            else:
+                text = str(item).strip()
+                if not text:
+                    continue
+                normalized_chunk_rows.append(
+                    {
+                        "content": text,
+                        "order_index": idx,
+                    }
+                )
+        docs = [row["content"] for row in normalized_chunk_rows]
 
         logger.info(f"Performing OpenIE")
         if self.global_config.openie_mode == 'offline':
-            self.pre_openie(docs)
+            self.pre_openie(normalized_chunk_rows)
 
         # 理论上已经构建过的不会重新构建
-        self.ver_embedding_store.insert_strings(docs)
+        self.ver_embedding_store.insert_chunk_rows(normalized_chunk_rows)
 
         if self.global_config.need_cluster:
             self._ensure_cluster_components()
@@ -967,6 +996,11 @@ class ComoRAG:
             dedup_openie: Dict[str, dict] = {}
             for openie_info in all_openie_info:
                 idx = openie_info.get('idx')
+                if idx in chunk_key_set:
+                    normalized = dict(openie_info)
+                    normalized['idx'] = idx
+                    dedup_openie[idx] = normalized
+                    continue
                 if not idx:
                     passage = openie_info.get('passage', '')
                     idx = compute_mdhash_id(passage, 'chunk-')

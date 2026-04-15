@@ -163,6 +163,9 @@ advanced:
 
 # AI (Gemini Agent) 配置
 ai:
+  # AI 相关数据统一存储目录（包含 ai.db / lancedb / runtime）
+  # 支持相对项目根目录或绝对路径
+  ai_storage_dir: "./ai_storage"
   genai:
     # 建议优先在环境变量配置密钥；若你希望集中管理，也可直接写在这里
     # api_key: ""
@@ -178,6 +181,10 @@ comorag:
   base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
   llm_model: "gemini-3.1-flash-lite-preview"
   embedding_model: "gemini-embedding-2-preview"
+  # 是否在客户端侧对 embedding 做 L2 归一化
+  embedding_normalize: true
+  # 可选：压缩输出维度，例如 768 / 1536 / 3072；留空表示使用模型默认维度
+  # embedding_output_dim: 768
   need_cluster: true
   openie_mode: "online" # online / offline
   chunk_size: 800
@@ -190,4 +197,3 @@ comorag:
 # custom:
 #   your_feature_1: value1
 #   your_feature_2: value2
-

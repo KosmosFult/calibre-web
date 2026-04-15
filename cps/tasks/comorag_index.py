@@ -8,12 +8,20 @@ from cps.comorag import service as comorag_service
 
 
 class TaskComoRAGIndex(CalibreTask):
-    def __init__(self, book_id: int, run_id: str, force: bool = False, task_message=N_("Building ComoRAG index")):
+    def __init__(
+        self,
+        book_id: int,
+        run_id: str,
+        force: bool = False,
+        chapter_indices=None,
+        task_message=N_("Building ComoRAG index"),
+    ):
         super(TaskComoRAGIndex, self).__init__(task_message)
         self.log = logger.create()
         self.book_id = int(book_id)
         self.run_id = run_id
         self.force = force
+        self.chapter_indices = chapter_indices
         self.message = f"Book #{self.book_id} queued"
         self.progress = 0.02
 
@@ -28,6 +36,7 @@ class TaskComoRAGIndex(CalibreTask):
                 run_id=self.run_id,
                 force=self.force,
                 progress_callback=self._progress_callback,
+                chapter_indices=self.chapter_indices,
             )
         if ok:
             self._handleSuccess()

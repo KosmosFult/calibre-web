@@ -36,6 +36,24 @@ def format_books(books):
     return json.dumps(results, ensure_ascii=False)
 
 
+def _estimate_text_words(text: str) -> int:
+    return len((text or "").split())
+
+
+def _serialize_chunk_payload(row):
+    return {
+        "order_id": row.get("order_id"),
+        "chunk_id": row.get("hash_id") or row.get("chunk_id"),
+        "chapter_id": row.get("chapter_id"),
+        "chapter_index": row.get("chapter_index"),
+        "chapter_title": row.get("chapter_title"),
+        "chunk_index_in_chapter": row.get("chunk_index_in_chapter"),
+        "word_count": int(row.get("word_count") or _estimate_text_words(row.get("content") or row.get("text") or "")),
+        "char_count": int(row.get("char_count") or len((row.get("content") or row.get("text") or ""))),
+        "text": row.get("content") or row.get("text") or "",
+    }
+
+
 @AgentTool(
     name="get_book_cover",
     description="获取书籍的封面图片。当需要向用户介绍书籍外观或封面细节时调用。",
@@ -257,8 +275,40 @@ def get_books_by_rating(limit: int = 5):
 
 
 @AgentTool(
+    name="get_book_outline",
+    description="获取书籍的章节目录和每章对应的 chunk order_id 范围。用于理解阅读结构，优先于旧的章节接口。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "book_id": {
+                "type": "integer",
+                "description": "书籍的 ID",
+            }
+        },
+        "required": ["book_id"],
+    },
+)
+def get_book_outline(book_id: int):
+    try:
+        outline = comorag_service.get_book_outline(book_id=int(book_id))
+        if not outline.get("chapters"):
+            return json.dumps(
+                {
+                    "status": "empty",
+                    "message": "Book outline not available. Build the ComoRAG index first.",
+                    "book_id": int(book_id),
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps({"status": "success", **outline}, ensure_ascii=False)
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("get_book_outline failed")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@AgentTool(
     name="get_book_chapters",
-    description="获取书籍的章节列表（不含内容）。用于了解书籍结构。",
+    description="获取书籍章节列表。兼容旧接口，内部基于 chunk 索引目录实现；建议优先使用 get_book_outline。",
     parameters={
         "type": "object",
         "properties": {
@@ -271,58 +321,25 @@ def get_books_by_rating(limit: int = 5):
     },
 )
 def get_book_chapters(book_id: int):
-    """
-    获取书籍的章节列表（不含内容）。用于了解书籍结构。
-
-    Args:
-        book_id: 书籍的 ID
-    """
-    from ..book_content_extractor import BookContentExtractor
-
-    session = calibre_db.session
-    book = session.query(db.Books).filter(db.Books.id == book_id).first()
-
-    if not book:
-        return json.dumps({"status": "error", "message": "Book not found"})
-
-    readable_formats = ["epub", "kepub", "txt"]
-    book_format = None
-    book_data = None
-
-    for data in book.data:
-        if data.format.lower() in readable_formats:
-            book_format = data.format.lower()
-            book_data = data
-            break
-
-    if not book_format:
-        return json.dumps(
-            {
-                "status": "error",
-                "message": f"Book has no readable format. Available: {[d.format for d in book.data]}",
-            }
-        )
-
-    file_path = os.path.normpath(
-        os.path.join(config.config_calibre_dir, book.path, book_data.name + "." + book_format)
-    )
-
-    if not os.path.exists(file_path):
-        return json.dumps({"status": "error", "message": "Book file not found on disk"})
-
     try:
-        content_data = BookContentExtractor.extract(file_path, book_format)
-
+        outline = comorag_service.get_book_outline(book_id=int(book_id))
         chapters_info = [
-            {"index": ch["index"], "title": ch["title"], "word_count": ch["word_count"]}
-            for ch in content_data["chapters"]
+            {
+                "index": chapter["chapter_index"],
+                "title": chapter["chapter_title"],
+                "word_count": chapter["word_count"],
+                "chunk_count": chapter["chunk_count"],
+                "start_order_id": chapter["start_order_id"],
+                "end_order_id": chapter["end_order_id"],
+            }
+            for chapter in outline.get("chapters", [])
         ]
-
         return json.dumps(
             {
-                "status": "success",
-                "book_title": content_data["title"],
-                "total_chapters": content_data["total_chapters"],
+                "status": "success" if chapters_info else "empty",
+                "book_id": int(book_id),
+                "total_chapters": len(chapters_info),
+                "total_chunks": outline.get("total_chunks", 0),
                 "chapters": chapters_info,
             },
             ensure_ascii=False,
@@ -335,7 +352,7 @@ def get_book_chapters(book_id: int):
 
 @AgentTool(
     name="read_book_chapter",
-    description="读取书籍的指定章节内容。用于回答关于书籍具体内容的问题。",
+    description="读取书籍的指定章节内容。兼容旧接口，内部按 chunk 顺序拼接；建议优先使用 read_chapter_by_chunks 或 read_book_segment。",
     parameters={
         "type": "object",
         "properties": {
@@ -356,73 +373,43 @@ def get_book_chapters(book_id: int):
     },
 )
 def read_book_chapter(book_id: int, chapter_index: int = 0, max_words: int = 3000):
-    """
-    读取书籍的指定章节内容。用于回答关于书籍具体内容的问题。
-
-    Args:
-        book_id: 书籍的 ID
-        chapter_index: 章节索引（从 0 开始）。如果不指定，默认读取第一章
-        max_words: 最多返回多少字，避免内容过长。默认 3000 字
-    """
-    from ..book_content_extractor import BookContentExtractor
-
-    session = calibre_db.session
-    book = session.query(db.Books).filter(db.Books.id == book_id).first()
-
-    if not book:
-        return json.dumps({"status": "error", "message": "Book not found"})
-
-    readable_formats = ["epub", "kepub", "txt"]
-    book_format = None
-    book_data = None
-
-    for data in book.data:
-        if data.format.lower() in readable_formats:
-            book_format = data.format.lower()
-            book_data = data
-            break
-
-    if not book_format:
-        return json.dumps(
-            {
-                "status": "error",
-                "message": f"Book has no readable format. Available: {[d.format for d in book.data]}",
-            }
-        )
-
-    file_path = os.path.normpath(
-        os.path.join(config.config_calibre_dir, book.path, book_data.name + "." + book_format)
-    )
-
-    if not os.path.exists(file_path):
-        return json.dumps({"status": "error", "message": "Book file not found on disk"})
-
     try:
-        content_data = BookContentExtractor.extract(file_path, book_format)
-
-        if chapter_index >= len(content_data["chapters"]):
-            return json.dumps(
-                {
-                    "status": "error",
-                    "message": f"Chapter index {chapter_index} out of range. Total chapters: {len(content_data['chapters'])}",
-                }
-            )
-
-        chapter = content_data["chapters"][chapter_index]
-        content = chapter["content"]
-
-        if len(content) > max_words:
-            content = content[:max_words] + f"\n\n[... 内容过长，已截断。完整章节共 {chapter['word_count']} 字]"
+        chapter_payload = comorag_service.get_chapter_chunks(
+            book_id=int(book_id),
+            chapter_index=int(chapter_index),
+            start_chunk_offset=0,
+            limit_chunks=1000,
+        )
+        if chapter_payload.get("status") != "success":
+            return json.dumps(chapter_payload, ensure_ascii=False)
+        chunks = chapter_payload.get("chunks", [])
+        pieces = []
+        current_words = 0
+        truncated = False
+        for row in chunks:
+            text = row.get("content") or row.get("text") or ""
+            text_words = _estimate_text_words(text)
+            if current_words and current_words + text_words > max_words:
+                truncated = True
+                break
+            pieces.append(text)
+            current_words += text_words
+        content = "\n\n".join(pieces)
+        chapter = chapter_payload["chapter"]
+        if truncated:
+            content += "\n\n[... 内容过长，已按 chunk 截断，可继续调用 read_chapter_by_chunks 读取后续部分]"
 
         return json.dumps(
             {
                 "status": "success",
-                "book_title": content_data["title"],
-                "chapter_index": chapter["index"],
-                "chapter_title": chapter["title"],
+                "book_id": int(book_id),
+                "chapter_index": chapter["chapter_index"],
+                "chapter_title": chapter["chapter_title"],
+                "start_order_id": chapter["start_order_id"],
+                "end_order_id": chapter["end_order_id"],
                 "content": content,
                 "total_word_count": chapter["word_count"],
-                "returned_words": min(len(content), max_words),
+                "returned_words": current_words,
             },
             ensure_ascii=False,
         )
@@ -430,6 +417,139 @@ def read_book_chapter(book_id: int, chapter_index: int = 0, max_words: int = 300
     except Exception as e:
         log.error(f"Failed to read book chapter: {e}")
         return json.dumps({"status": "error", "message": str(e)})
+
+
+@AgentTool(
+    name="read_book_segment",
+    description="从指定 order_id 开始顺序读取连续多个 chunk。适合从头读、继续往下读，或按顺序核查原文。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "book_id": {"type": "integer", "description": "书籍 ID"},
+            "start_order_id": {"type": "integer", "description": "起始 chunk 顺序号（order_id）"},
+            "limit": {"type": "integer", "description": "连续返回多少个 chunk，默认 3"},
+        },
+        "required": ["book_id", "start_order_id"],
+    },
+)
+def read_book_segment(book_id: int, start_order_id: int, limit: int = 3):
+    try:
+        rows = comorag_service.get_chunks_by_order_range(
+            book_id=int(book_id),
+            start_order_id=int(start_order_id),
+            limit=max(1, int(limit)),
+        )
+        if not rows:
+            return json.dumps(
+                {
+                    "status": "empty",
+                    "message": "No chunks found for this range",
+                    "book_id": int(book_id),
+                    "start_order_id": int(start_order_id),
+                },
+                ensure_ascii=False,
+            )
+        items = [_serialize_chunk_payload(row) for row in rows]
+        return json.dumps(
+            {
+                "status": "success",
+                "book_id": int(book_id),
+                "start_order_id": int(start_order_id),
+                "returned_count": len(items),
+                "items": items,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("read_book_segment failed")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@AgentTool(
+    name="read_book_window",
+    description="围绕某个命中的 order_id 读取上下文窗口。适合在检索命中后核查前后文。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "book_id": {"type": "integer", "description": "书籍 ID"},
+            "center_order_id": {"type": "integer", "description": "中心 chunk 的 order_id"},
+            "before": {"type": "integer", "description": "向前读取多少个 chunk，默认 1"},
+            "after": {"type": "integer", "description": "向后读取多少个 chunk，默认 1"},
+        },
+        "required": ["book_id", "center_order_id"],
+    },
+)
+def read_book_window(book_id: int, center_order_id: int, before: int = 1, after: int = 1):
+    try:
+        rows = comorag_service.get_chunk_window(
+            book_id=int(book_id),
+            center_order_id=int(center_order_id),
+            before=max(0, int(before)),
+            after=max(0, int(after)),
+        )
+        if not rows:
+            return json.dumps(
+                {
+                    "status": "empty",
+                    "message": "No chunks found for this window",
+                    "book_id": int(book_id),
+                    "center_order_id": int(center_order_id),
+                },
+                ensure_ascii=False,
+            )
+        items = [_serialize_chunk_payload(row) for row in rows]
+        return json.dumps(
+            {
+                "status": "success",
+                "book_id": int(book_id),
+                "center_order_id": int(center_order_id),
+                "items": items,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("read_book_window failed")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@AgentTool(
+    name="read_chapter_by_chunks",
+    description="按章节内的 chunk 范围读取内容。适合分段阅读某一章，不会一次返回整章大文本。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "book_id": {"type": "integer", "description": "书籍 ID"},
+            "chapter_index": {"type": "integer", "description": "章节索引（从 0 开始）"},
+            "start_chunk_offset": {"type": "integer", "description": "从该章节内第几个 chunk 开始，默认 0"},
+            "limit_chunks": {"type": "integer", "description": "最多返回多少个 chunk，默认 5"},
+        },
+        "required": ["book_id", "chapter_index"],
+    },
+)
+def read_chapter_by_chunks(book_id: int, chapter_index: int, start_chunk_offset: int = 0, limit_chunks: int = 5):
+    try:
+        payload = comorag_service.get_chapter_chunks(
+            book_id=int(book_id),
+            chapter_index=int(chapter_index),
+            start_chunk_offset=max(0, int(start_chunk_offset)),
+            limit_chunks=max(1, int(limit_chunks)),
+        )
+        if payload.get("status") != "success":
+            return json.dumps(payload, ensure_ascii=False)
+        items = [_serialize_chunk_payload(row) for row in payload.get("chunks", [])]
+        return json.dumps(
+            {
+                "status": "success",
+                "book_id": int(book_id),
+                "chapter": payload["chapter"],
+                "returned_count": len(items),
+                "items": items,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:  # pylint: disable=broad-except
+        log.exception("read_chapter_by_chunks failed")
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
 def _extract_order_ids_from_rag_fields(*fields):
@@ -463,8 +583,9 @@ def _extract_order_ids_from_rag_fields(*fields):
     description=(
         "使用 ComoRAG 根据问题对一本书的内容进行检索。"
         "当用户提到剧情细节、角色关系、时间线、证据链、凶手推理等书内问题时优先调用。"
-        "参数必须包含 book_id 与 question。若 return_chunks=true，将返回命中的 chunk order_id 列表，"
-        "便于在你需要时继续调用 get_book_chunk_by_order 拉取原文。"
+        "它返回的是一份可验证的推理草稿 answer_draft，而不是最终定稿。"
+        "草稿中可能包含 [order_id=...] 注释，主 Agent 可以据此自行决定是否继续阅读原文、翻页推理，或再次向 comorag 发起新的问题。"
+        "参数必须包含 book_id 与 question。若 return_chunks=true，将额外返回草稿中提到的 chunk order_id 列表。"
     ),
     parameters={
         "type": "object",
@@ -497,13 +618,16 @@ def comorag_ask_book(book_id: int, question: str, return_chunks: bool = False):
             "book_id": result.get("book_id"),
             "question": result.get("question"),
             "answer": result.get("answer"),
+            "answer_draft": result.get("answer_draft") or result.get("answer"),
+            "trace": result.get("trace") or {},
             "evidence_preview": (result.get("docs") or "")[:2400],
             "summary_preview": (result.get("summary") or "")[:1600],
             "timeline_preview": (result.get("timeline") or "")[:1600],
             "index": result.get("index"),
         }
         if return_chunks:
-            matched_order_ids = _extract_order_ids_from_rag_fields(
+            matched_order_ids = (result.get("trace") or {}).get("mentioned_order_ids") or _extract_order_ids_from_rag_fields(
+                result.get("answer_draft") or result.get("answer"),
                 result.get("docs"),
                 result.get("summary"),
                 result.get("timeline"),
@@ -556,6 +680,12 @@ def get_book_chunk_by_order(book_id: int, order_id: int):
                 "book_id": int(book_id),
                 "order_id": int(order_id),
                 "chunk_id": row.get("hash_id"),
+                "chapter_id": row.get("chapter_id"),
+                "chapter_index": row.get("chapter_index"),
+                "chapter_title": row.get("chapter_title"),
+                "chunk_index_in_chapter": row.get("chunk_index_in_chapter"),
+                "word_count": row.get("word_count"),
+                "char_count": row.get("char_count"),
                 "text": row.get("content"),
             },
             ensure_ascii=False,
@@ -572,8 +702,12 @@ __all__ = [
     "get_recent_books",
     "get_random_books",
     "get_books_by_rating",
+    "get_book_outline",
     "get_book_chapters",
     "read_book_chapter",
+    "read_book_segment",
+    "read_book_window",
+    "read_chapter_by_chunks",
     "comorag_ask_book",
     "get_book_chunk_by_order",
 ]

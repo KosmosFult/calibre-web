@@ -4,12 +4,15 @@ from .cw_login import login_required, current_user
 import datetime
 import json
 import os
+import queue
+import threading
 from .agent import CalibreAgent
 from . import ai_db
 from .config_loader import get_yaml_loader
 from .comorag import service as comorag_service
 
 ai = Blueprint('ai', __name__, url_prefix='/ai')
+STREAM_HEARTBEAT_INTERVAL = 10
 
 # 初始化 AI 数据库
 ai_db.init_db()
@@ -158,9 +161,22 @@ def comorag_index_status(book_id):
 @login_required
 def comorag_build_index(book_id):
     try:
-        force_raw = request.form.get("force") if request.form else None
+        payload = request.get_json(silent=True) or {}
+        force_raw = payload.get("force")
+        chapter_indices_raw = payload.get("chapter_indices")
+        if force_raw is None and request.form:
+            force_raw = request.form.get("force")
+        if chapter_indices_raw is None and request.form:
+            chapter_indices_raw = request.form.get("chapter_indices")
         force = str(force_raw).lower() in {"1", "true", "yes", "on"}
-        ok, payload = comorag_service.trigger_index_build(book_id=int(book_id), force=force)
+
+        chapter_indices_raw = [0,1,2]
+
+        ok, payload = comorag_service.trigger_index_build(
+            book_id=int(book_id),
+            force=force,
+            chapter_indices=chapter_indices_raw,
+        )
         if ok:
             code = 202
         else:
@@ -223,12 +239,42 @@ def chat():
 
             history_checkpoint = len(agent.history)
 
-            try:
-                for chunk in agent.chat():
-                    yield json.dumps({'text': chunk}) + '\n'
-            except Exception as e:
-                yield json.dumps({'text': f"Error from AI: {str(e)}"}) + '\n'
-                return
+            stream_queue = queue.Queue()
+            stream_done = threading.Event()
+
+            def run_agent():
+                try:
+                    for chunk in agent.chat():
+                        stream_queue.put(("chunk", chunk))
+                except Exception as e:  # pylint: disable=broad-except
+                    stream_queue.put(("error", str(e)))
+                finally:
+                    stream_done.set()
+
+            worker = threading.Thread(target=run_agent, daemon=True)
+            worker.start()
+
+            while True:
+                try:
+                    item_type, payload = stream_queue.get(timeout=STREAM_HEARTBEAT_INTERVAL)
+                    if item_type == "chunk":
+                        yield json.dumps({'text': payload}) + '\n'
+                    else:
+                        yield json.dumps({'text': f"Error from AI: {payload}"}) + '\n'
+                        return
+                except queue.Empty:
+                    if stream_done.is_set():
+                        break
+                    # Keep the HTTP stream active so browsers / proxies do not timeout on long tool calls.
+                    yield json.dumps({'heartbeat': True}) + '\n'
+
+            while not stream_queue.empty():
+                item_type, payload = stream_queue.get_nowait()
+                if item_type == "chunk":
+                    yield json.dumps({'text': payload}) + '\n'
+                else:
+                    yield json.dumps({'text': f"Error from AI: {payload}"}) + '\n'
+                    return
 
             new_messages = agent.history[history_checkpoint:]
 
@@ -253,4 +299,7 @@ def chat():
         finally:
             db_sess.close()
 
-    return Response(stream_with_context(generate()), content_type='application/x-ndjson')
+    response = Response(stream_with_context(generate()), content_type='application/x-ndjson')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response

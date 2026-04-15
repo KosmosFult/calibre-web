@@ -217,6 +217,8 @@ rate_limit:
 
 ```yaml
 ai:
+  # 统一 AI 数据目录（ai.db / lancedb / runtime）
+  ai_storage_dir: "./ai_storage"
   genai:
     # api_key: "your-api-key"
     # base_url: ""
@@ -233,6 +235,7 @@ comorag:
   chunk_size: 800
   chunk_overlap: 200
   enable_contextual: false
+  # 兼容旧配置：未配置 ai.ai_storage_dir 时可单独指定 runtime 目录
   # runtime_dir: "cps/comorag/runtime"
 ```
 
@@ -347,4 +350,3 @@ pip install PyYAML
 ---
 
 **提示**：首次运行建议使用默认配置，然后根据需要逐步修改配置文件。
-

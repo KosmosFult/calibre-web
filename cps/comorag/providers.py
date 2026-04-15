@@ -138,9 +138,18 @@ class ProviderClient:
             n=n,
         )
 
-    def embed(self, *, model: str, texts: List[str]) -> List[List[float]]:
+    def embed(
+        self,
+        *,
+        model: str,
+        texts: List[str],
+        output_dimensionality: Optional[int] = None,
+    ) -> List[List[float]]:
         if self.provider == "google_genai":
-            response = self._client.models.embed_content(model=model, contents=texts)
+            config = None
+            if output_dimensionality is not None:
+                config = {"output_dimensionality": int(output_dimensionality)}
+            response = self._client.models.embed_content(model=model, contents=texts, config=config)
             embeddings = getattr(response, "embeddings", None) or []
             values: List[List[float]] = []
             for item in embeddings:
@@ -150,7 +159,10 @@ class ProviderClient:
                     values.append(list(item.get("values", [])))
             return values
 
-        response = self._client.embeddings.create(input=texts, model=model)
+        params: Dict[str, Any] = {"input": texts, "model": model}
+        if output_dimensionality is not None:
+            params["dimensions"] = int(output_dimensionality)
+        response = self._client.embeddings.create(**params)
         return [list(item.embedding) for item in response.data]
 
     def _chat_completion_openai_compat(

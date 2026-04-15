@@ -509,6 +509,9 @@
                                 if (line.trim()) {
                                     try {
                                         const data = JSON.parse(line)
+                                        if (data.heartbeat) {
+                                            continue
+                                        }
                                         if (data.text) {
                                             messages.value[aiMsgIndex].content += data.text
                                             scrollToBottom()
@@ -523,7 +526,8 @@
                         fetchSessions()
                         
                     } catch (error) {
-                        messages.value[aiMsgIndex].content += '\n[出错了: ' + error.message + ']'
+                        const message = error && error.message ? error.message : '连接已中断，请稍后重试'
+                        messages.value[aiMsgIndex].content += '\n[出错了: ' + message + ']'
                     } finally {
                         messages.value[aiMsgIndex].streaming = false
                         isLoading.value = false

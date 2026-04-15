@@ -56,6 +56,7 @@ class OpenAIEmbeddingModel(BaseEmbeddingModel):
         config_dict = {
             "embedding_model_name": self.embedding_model_name,
             "norm": self.global_config.embedding_return_as_normalized,
+            "output_dimensionality": self.global_config.embedding_output_dim,
             # "max_seq_length": self.global_config.embedding_max_seq_len,
             "model_init_params": {
                 # "model_name_or_path": self.embedding_model_name2mode_name_or_path[self.embedding_model_name],
@@ -77,15 +78,23 @@ class OpenAIEmbeddingModel(BaseEmbeddingModel):
         logger.debug(f"Init {self.__class__.__name__}'s embedding_config: {self.embedding_config}")
 
     def encode(self, texts: List[str]):
+        output_dimensionality = getattr(self.embedding_config, "output_dimensionality", None)
         texts = [t.replace("\n", " ") for t in texts]
         texts = [t if t != '' else ' ' for t in texts]
         if self.client is not None:
-            response = self.client.embeddings.create(input=texts, model=self.embedding_model_name)
+            params = {"input": texts, "model": self.embedding_model_name}
+            if output_dimensionality is not None:
+                params["dimensions"] = int(output_dimensionality)
+            response = self.client.embeddings.create(**params)
             logger.info(f"OpenAI API raw response type: {type(response)}")
             logger.info(f"OpenAI API raw response content: {str(response)[:500]}")
             results = np.array([v.embedding for v in response.data])
         else:
-            values = self.provider_client.embed(model=self.embedding_model_name, texts=texts)
+            values = self.provider_client.embed(
+                model=self.embedding_model_name,
+                texts=texts,
+                output_dimensionality=output_dimensionality,
+            )
             results = np.array(values, dtype=np.float32)
 
         return results
@@ -94,12 +103,19 @@ class OpenAIEmbeddingModel(BaseEmbeddingModel):
         if isinstance(texts, str): texts = [texts]
 
         params = deepcopy(self.embedding_config.encode_params)
-        if kwargs: params.update(kwargs)
+        if kwargs:
+            params.update(kwargs)
 
-        if "instruction" in kwargs:
-            if kwargs["instruction"] != '':
-                params["instruction"] = f"Instruct: {kwargs['instruction']}\nQuery: "
-            # del params["instruction"]
+        instruction = params.get("instruction") or ""
+        if instruction:
+            texts = [f"Instruct: {instruction}\nQuery: {text}" for text in texts]
+
+        normalize = params.pop("norm", self.embedding_config.norm)
+        output_dimensionality = params.pop(
+            "output_dimensionality",
+            getattr(self.embedding_config, "output_dimensionality", None),
+        )
+        self.embedding_config.output_dimensionality = output_dimensionality
 
         logger.debug(f"Calling {self.__class__.__name__} with:\n{params}")
 
@@ -125,7 +141,7 @@ class OpenAIEmbeddingModel(BaseEmbeddingModel):
             pbar.close()
             results = np.concatenate(results)
 
-        if self.embedding_config.norm:
+        if normalize:
             results = (results.T / np.linalg.norm(results, axis=1)).T
 
         return results

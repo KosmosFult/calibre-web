@@ -142,6 +142,10 @@ class BaseConfig:
         default=True,
         metadata={"help": "Whether to normalize encoded embeddings not."}
     )
+    embedding_output_dim: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional output dimensionality for API embedding models."}
+    )
     embedding_max_seq_len: int = field(
         default=2048,
         metadata={"help": "Max sequence length for the embedding model."}

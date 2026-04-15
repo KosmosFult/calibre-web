@@ -9,11 +9,15 @@ import re
 import json
 
 import lancedb
+import pyarrow as pa
 
 from .utils.misc_utils import compute_mdhash_id, NerRawOutput, TripleRawOutput
 from .. import ai_db
+from ..ai_storage import get_lancedb_dir
 
 logger = logging.getLogger(__name__)
+
+CHAPTER_TABLE = "ai_rag_chapters"
 
 class EmbeddingStore:
     TYPE_TO_META_TABLE = {
@@ -65,8 +69,7 @@ class EmbeddingStore:
         self.db_path = ai_db.DB_PATH
         # Keep filename for compatibility with downstream code that inspects dirname.
         self.filename = os.path.join(db_filename or ".", f"vdb_{self.namespace}.sqlite")
-        self.vector_db_path = os.path.join(os.path.dirname(self.db_path), "lancedb")
-        os.makedirs(self.vector_db_path, exist_ok=True)
+        self.vector_db_path = get_lancedb_dir()
         self.vector_db = lancedb.connect(self.vector_db_path)
         self.vector_table = None
         self._load_data()
@@ -108,10 +111,40 @@ class EmbeddingStore:
     def _init_vector_table(self, records: List[Dict[str, Any]]):
         if not records:
             return
+        table_data = self._records_to_arrow_table(records)
         if self._get_vector_table() is None:
-            self.vector_table = self.vector_db.create_table(self.vector_table_name, data=records, mode="overwrite")
+            self.vector_table = self.vector_db.create_table(self.vector_table_name, data=table_data, mode="overwrite")
         else:
-            self.vector_table.add(records)
+            self.vector_table.add(table_data)
+
+    def _records_to_arrow_table(self, records: List[Dict[str, Any]]) -> pa.Table:
+        normalized = {
+            "book_id": [int(record.get("book_id", 0)) for record in records],
+            "namespace": [str(record.get("namespace", "")) for record in records],
+            "hash_id": [str(record.get("hash_id", "")) for record in records],
+            "content": [str(record.get("content", "")) for record in records],
+            "order_index": [int(record.get("order_index", -1)) for record in records],
+            "vector": [
+                [float(v) for v in (record.get("vector") or [])]
+                for record in records
+            ],
+        }
+        fields = [
+            pa.field("book_id", pa.int64()),
+            pa.field("namespace", pa.string()),
+            pa.field("hash_id", pa.string()),
+            pa.field("content", pa.string()),
+            pa.field("order_index", pa.int64()),
+            pa.field("vector", pa.list_(pa.float32())),
+        ]
+        if self.embedding_type != "ver":
+            normalized["source_order_ids"] = [
+                [int(v) for v in (record.get("source_order_ids") or [])]
+                for record in records
+            ]
+            fields.insert(4, pa.field("source_order_ids", pa.list_(pa.int64())))
+        schema = pa.schema(fields)
+        return pa.Table.from_pydict(normalized, schema=schema)
 
     def get_missing_string_hash_ids(self, texts: List[str]):
         nodes_dict = {}
@@ -167,9 +200,57 @@ class EmbeddingStore:
         texts_to_encode = [nodes_dict[hash_id]["content"] for hash_id in missing_ids]
 
         missing_embeddings = self.embedding_model.batch_encode(texts_to_encode)
+        if len(missing_embeddings) != len(missing_ids):
+            raise ValueError(
+                f"embedding_model.batch_encode returned {len(missing_embeddings)} embeddings "
+                f"for {len(missing_ids)} texts in namespace={self.namespace}"
+            )
 
         source_for_missing = {h: source_by_hash.get(h, []) for h in missing_ids}
         self._upsert(missing_ids, texts_to_encode, missing_embeddings, source_order_ids_by_hash=source_for_missing)
+
+    def insert_chunk_rows(self, chunk_rows: List[Dict[str, Any]]):
+        if self.embedding_type != "ver":
+            raise ValueError("insert_chunk_rows is only supported for ver embedding stores")
+        if not chunk_rows:
+            return
+
+        normalized_rows: List[Dict[str, Any]] = []
+        seen_hashes: Set[str] = set()
+        for idx, row in enumerate(chunk_rows):
+            text = str(row.get("content") or row.get("text") or "").strip()
+            if not text:
+                continue
+            order_index = int(row.get("order_index", idx))
+            hash_id = str(row.get("hash_id") or f"{self.namespace}-{self.book_id}-{order_index}")
+            if hash_id in seen_hashes:
+                continue
+            seen_hashes.add(hash_id)
+            normalized_rows.append(
+                {
+                    "hash_id": hash_id,
+                    "content": text,
+                    "order_index": int(order_index),
+                    "chapter_id": row.get("chapter_id"),
+                    "chapter_index": row.get("chapter_index"),
+                    "chapter_title": row.get("chapter_title"),
+                    "chunk_index_in_chapter": row.get("chunk_index_in_chapter"),
+                    "word_count": int(row.get("word_count") or len(text.split())),
+                    "char_count": int(row.get("char_count") or len(text)),
+                }
+            )
+
+        if not normalized_rows:
+            return
+
+        texts_to_encode = [row["content"] for row in normalized_rows]
+        embeddings = self.embedding_model.batch_encode(texts_to_encode)
+        if len(embeddings) != len(normalized_rows):
+            raise ValueError(
+                f"embedding_model.batch_encode returned {len(embeddings)} embeddings "
+                f"for {len(normalized_rows)} ver chunks in namespace={self.namespace}"
+            )
+        self._replace_ver_rows(normalized_rows, embeddings)
 
     def _ensure_tables(self):
         with self._connect() as conn:
@@ -182,7 +263,6 @@ class EmbeddingStore:
                     namespace TEXT NOT NULL,
                     hash_id TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    source_order_ids TEXT,
                     embedding BLOB NOT NULL,
                     embedding_dim INTEGER NOT NULL,
                     order_index INTEGER NOT NULL,
@@ -200,8 +280,47 @@ class EmbeddingStore:
             )
             cur.execute(f"PRAGMA table_info({self.meta_table})")
             existing_cols = {row[1] for row in cur.fetchall()}
-            if "source_order_ids" not in existing_cols:
+            if self.embedding_type != "ver" and "source_order_ids" not in existing_cols:
                 cur.execute(f"ALTER TABLE {self.meta_table} ADD COLUMN source_order_ids TEXT")
+            if self.embedding_type == "ver":
+                ver_columns = {
+                    "chapter_id": "TEXT",
+                    "chapter_index": "INTEGER",
+                    "chapter_title": "TEXT",
+                    "chunk_index_in_chapter": "INTEGER",
+                    "word_count": "INTEGER",
+                    "char_count": "INTEGER",
+                }
+                for column_name, column_type in ver_columns.items():
+                    if column_name not in existing_cols:
+                        cur.execute(
+                            f"ALTER TABLE {self.meta_table} ADD COLUMN {column_name} {column_type}"
+                        )
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {CHAPTER_TABLE} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        book_id INTEGER NOT NULL,
+                        chapter_id TEXT,
+                        chapter_index INTEGER NOT NULL,
+                        chapter_title TEXT,
+                        start_order_index INTEGER NOT NULL,
+                        end_order_index INTEGER NOT NULL,
+                        chunk_count INTEGER NOT NULL,
+                        word_count INTEGER NOT NULL DEFAULT 0,
+                        char_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(book_id, chapter_index)
+                    )
+                    """
+                )
+                cur.execute(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{CHAPTER_TABLE}_book_chapter
+                    ON {CHAPTER_TABLE}(book_id, chapter_index)
+                    """
+                )
             conn.commit()
 
     def _load_data(self):
@@ -211,36 +330,87 @@ class EmbeddingStore:
         self.hash_id_to_text, self.text_to_hash_id = {}, {}
         with self._connect() as conn:
             cur = conn.cursor()
-            cur.execute(
-                f"""
-                SELECT hash_id, content, source_order_ids, embedding
-                FROM {self.meta_table}
-                WHERE book_id = ? AND namespace = ?
-                ORDER BY order_index ASC
-                """,
-                (self.book_id, self.namespace),
-            )
+            if self.embedding_type == "ver":
+                cur.execute(
+                    f"""
+                    SELECT hash_id, content, embedding, order_index, chapter_id, chapter_index, chapter_title, chunk_index_in_chapter,
+                           word_count, char_count
+                    FROM {self.meta_table}
+                    WHERE book_id = ? AND namespace = ?
+                    ORDER BY order_index ASC
+                    """,
+                    (self.book_id, self.namespace),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT hash_id, content, source_order_ids, embedding, order_index
+                    FROM {self.meta_table}
+                    WHERE book_id = ? AND namespace = ?
+                    ORDER BY order_index ASC
+                    """,
+                    (self.book_id, self.namespace),
+                )
             rows = cur.fetchall()
 
         self.hash_id_to_source_orders = {}
-        for hash_id, content, source_order_ids_json, embedding_blob in rows:
+        self.hash_id_to_order_index = {}
+        for row_tuple in rows:
+            hash_id = row_tuple[0]
+            content = row_tuple[1]
+            if self.embedding_type == "ver":
+                embedding_blob = row_tuple[2]
+                order_index = row_tuple[3]
+                source_orders = []
+            else:
+                source_order_ids_json = row_tuple[2]
+                embedding_blob = row_tuple[3]
+                order_index = row_tuple[4]
+                source_orders = []
+                if source_order_ids_json:
+                    try:
+                        source_orders = json.loads(source_order_ids_json)
+                    except ValueError:
+                        source_orders = []
             embedding = np.frombuffer(embedding_blob, dtype=np.float32)
             self.hash_ids.append(hash_id)
             self.texts.append(content)
             self.embeddings.append(embedding)
-            source_orders = []
-            if source_order_ids_json:
-                try:
-                    source_orders = json.loads(source_order_ids_json)
-                except ValueError:
-                    source_orders = []
+            self.hash_id_to_order_index[hash_id] = int(order_index)
             self.hash_id_to_source_orders[hash_id] = source_orders
+            row = {
+                "hash_id": hash_id,
+                "content": content,
+                "order_index": int(order_index),
+            }
+            if self.embedding_type != "ver":
+                row["source_order_ids"] = source_orders
+            if self.embedding_type == "ver":
+                (
+                    _hash_id,
+                    _content,
+                    _embedding_blob,
+                    _order_index,
+                    chapter_id,
+                    chapter_index,
+                    chapter_title,
+                    chunk_index_in_chapter,
+                    word_count,
+                    char_count,
+                ) = row_tuple
+                row.update(
+                    {
+                        "chapter_id": chapter_id,
+                        "chapter_index": chapter_index,
+                        "chapter_title": chapter_title,
+                        "chunk_index_in_chapter": chunk_index_in_chapter,
+                        "word_count": int(word_count or 0),
+                        "char_count": int(char_count or 0),
+                    }
+                )
+            self.hash_id_to_row[hash_id] = row
 
         self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
-        self.hash_id_to_row = {
-            h: {"hash_id": h, "content": t, "source_order_ids": self.hash_id_to_source_orders.get(h, [])}
-            for h, t in zip(self.hash_ids, self.texts)
-        }
         self.hash_id_to_text = {h: self.texts[idx] for idx, h in enumerate(self.hash_ids)}
         self.text_to_hash_id = {self.texts[idx]: h for idx, h in enumerate(self.hash_ids)}
         logger.info(
@@ -254,10 +424,6 @@ class EmbeddingStore:
         self._get_vector_table()
 
     def _save_data(self):
-        self.hash_id_to_row = {
-            h: {"hash_id": h, "content": t, "source_order_ids": self.hash_id_to_source_orders.get(h, [])}
-            for h, t in zip(self.hash_ids, self.texts)
-        }
         self.hash_id_to_idx = {h: idx for idx, h in enumerate(self.hash_ids)}
         self.hash_id_to_text = {h: self.texts[idx] for idx, h in enumerate(self.hash_ids)}
         self.text_to_hash_id = {self.texts[idx]: h for idx, h in enumerate(self.hash_ids)}
@@ -273,6 +439,12 @@ class EmbeddingStore:
 
         if not hash_ids:
             return
+        if not (len(hash_ids) == len(texts) == len(embeddings)):
+            raise ValueError(
+                "EmbeddingStore._upsert length mismatch: "
+                f"hash_ids={len(hash_ids)} texts={len(texts)} embeddings={len(embeddings)} "
+                f"namespace={self.namespace}"
+            )
         source_order_ids_by_hash = source_order_ids_by_hash or {}
         self._ensure_tables()
         now = datetime.datetime.utcnow().isoformat()
@@ -316,13 +488,8 @@ class EmbeddingStore:
             order_entries=order_entries,
             source_order_ids_by_hash=source_order_ids_by_hash,
         )
-        self.embeddings.extend([np.asarray(e, dtype=np.float32) for e in embeddings])
-        self.hash_ids.extend(hash_ids)
-        self.texts.extend(texts)
-        for hash_id in hash_ids:
-            self.hash_id_to_source_orders[hash_id] = source_order_ids_by_hash.get(hash_id, [])
-        logger.info("Saving new records.")
-        self._save_data()
+        logger.info("Reloading embedding store after upsert.")
+        self._load_data()
 
     def _upsert_lancedb(
         self,
@@ -377,6 +544,16 @@ class EmbeddingStore:
             return []
 
         indices = np.array([self.hash_id_to_idx[h] for h in hash_ids], dtype=np.intp)
+        if indices.size and int(indices.max()) >= len(self.embeddings):
+            logger.warning(
+                "Detected stale in-memory embedding index for namespace=%s; reloading store "
+                "(max_idx=%s, embedding_count=%s)",
+                self.namespace,
+                int(indices.max()),
+                len(self.embeddings),
+            )
+            self._load_data()
+            indices = np.array([self.hash_id_to_idx[h] for h in hash_ids], dtype=np.intp)
         embeddings = np.array(self.embeddings, dtype=dtype)[indices]
 
         return embeddings
@@ -389,7 +566,121 @@ class EmbeddingStore:
             Dict[str, int]: Mapping from hash values to sequential positions, e.g., {'hash1': 0, 'hash2': 1, ...}
         """
         # Since the texts list maintains insertion order, we can use it to build the order mapping
-        return {h: idx for idx, h in enumerate(self.hash_ids)}
+        return deepcopy(self.hash_id_to_order_index)
+
+    def _replace_ver_rows(self, chunk_rows: List[Dict[str, Any]], embeddings: List[np.ndarray]):
+        self._ensure_tables()
+        now = datetime.datetime.utcnow().isoformat()
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"DELETE FROM {self.meta_table} WHERE book_id = ? AND namespace = ?",
+                (self.book_id, self.namespace),
+            )
+            cur.execute(
+                f"DELETE FROM {CHAPTER_TABLE} WHERE book_id = ?",
+                (self.book_id,),
+            )
+            for row, embedding in zip(chunk_rows, embeddings):
+                emb_arr = np.asarray(embedding, dtype=np.float32)
+                cur.execute(
+                    f"""
+                    INSERT INTO {self.meta_table}
+                    (book_id, namespace, hash_id, content, embedding, embedding_dim, order_index,
+                     chapter_id, chapter_index, chapter_title, chunk_index_in_chapter,
+                     word_count, char_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        self.book_id,
+                        self.namespace,
+                        row["hash_id"],
+                        row["content"],
+                        emb_arr.tobytes(),
+                        int(emb_arr.shape[0]),
+                        int(row["order_index"]),
+                        row.get("chapter_id"),
+                        row.get("chapter_index"),
+                        row.get("chapter_title"),
+                        row.get("chunk_index_in_chapter"),
+                        int(row.get("word_count") or 0),
+                        int(row.get("char_count") or 0),
+                        now,
+                        now,
+                    ),
+                )
+            self._rebuild_chapters(cur=cur, chunk_rows=chunk_rows, now=now)
+            conn.commit()
+
+        self._replace_ver_lancedb(chunk_rows=chunk_rows, embeddings=embeddings)
+        self._load_data()
+
+    def _rebuild_chapters(self, cur, chunk_rows: List[Dict[str, Any]], now: str):
+        chapters: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        for row in chunk_rows:
+            chapter_index = int(row.get("chapter_index") or 0)
+            chapter_title = str(row.get("chapter_title") or f"Chapter {chapter_index + 1}")
+            chapter_id = str(row.get("chapter_id") or f"chapter-{chapter_index}")
+            key = (chapter_index, chapter_id)
+            if key not in chapters:
+                chapters[key] = {
+                    "chapter_index": chapter_index,
+                    "chapter_id": chapter_id,
+                    "chapter_title": chapter_title,
+                    "start_order_index": int(row["order_index"]),
+                    "end_order_index": int(row["order_index"]),
+                    "chunk_count": 0,
+                    "word_count": 0,
+                    "char_count": 0,
+                }
+            entry = chapters[key]
+            entry["start_order_index"] = min(entry["start_order_index"], int(row["order_index"]))
+            entry["end_order_index"] = max(entry["end_order_index"], int(row["order_index"]))
+            entry["chunk_count"] += 1
+            entry["word_count"] += int(row.get("word_count") or 0)
+            entry["char_count"] += int(row.get("char_count") or 0)
+
+        for entry in sorted(chapters.values(), key=lambda item: item["chapter_index"]):
+            cur.execute(
+                f"""
+                INSERT INTO {CHAPTER_TABLE}
+                (book_id, chapter_id, chapter_index, chapter_title, start_order_index, end_order_index,
+                 chunk_count, word_count, char_count, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.book_id,
+                    entry["chapter_id"],
+                    entry["chapter_index"],
+                    entry["chapter_title"],
+                    entry["start_order_index"],
+                    entry["end_order_index"],
+                    entry["chunk_count"],
+                    entry["word_count"],
+                    entry["char_count"],
+                    now,
+                    now,
+                ),
+            )
+
+    def _replace_ver_lancedb(self, chunk_rows: List[Dict[str, Any]], embeddings: List[np.ndarray]):
+        records = []
+        for row, emb in zip(chunk_rows, embeddings):
+            emb_arr = np.asarray(emb, dtype=np.float32)
+            record = {
+                "book_id": self.book_id,
+                "namespace": self.namespace,
+                "hash_id": row["hash_id"],
+                "content": row["content"],
+                "order_index": int(row["order_index"]),
+                "vector": emb_arr.tolist(),
+            }
+            records.append(record)
+        table = self._get_vector_table()
+        if table is not None:
+            table.delete(f"book_id = {self.book_id} AND namespace = '{self.namespace}'")
+            self.vector_table = table
+        self._init_vector_table(records)
 
     def list_namespaces(self, prefix: str = "") -> List[str]:
         all_tables = list(self.TYPE_TO_META_TABLE.values())

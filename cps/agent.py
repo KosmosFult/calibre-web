@@ -4,6 +4,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+from flask import has_app_context
+
 from .ai_tools import AgentTool
 
 from google import genai
@@ -42,9 +44,9 @@ class CalibreAgent:
             "一名推理小说爱好者，擅长推理和解密。"
             "作为图书管家，你能够为用户提供相关服务，包括但不限于推荐书籍、概述内容、回答关于书籍的各种问题。"
             "需要查询书库时，请主动调用提供的工具。"
-            "当用户询问某本书的剧情细节、角色关系、时间线、证据链、推理结论时，优先调用 comorag_ask_book 获取检索后再作答，"
-            "不要凭空编造情节。若需要核对原文，可在 comorag_ask_book 中设置 return_chunks=true 获取命中的 order_id"
-            # "再调用 get_book_chunk_by_order(book_id, order_id) 获取对应 chunk。"
+            "当用户询问某本书的剧情细节、角色关系、时间线、证据链、推理结论时，优先调用 comorag_ask_book 获取一份可验证的推理草稿 answer_draft 后再决定如何作答。"
+            "你应把 comorag 的结果视为中间推理产物，而不是必须照抄的最终答案。你可以根据自身判断，自主决定是否继续阅读原文、是否围绕命中的 order_id 调用 read_book_window、read_book_segment、read_chapter_by_chunks 等工具做翻页推理，"
+            "也可以在有必要时再次向 comorag_ask_book 发起新的、更聚焦的问题。不要凭空编造情节。"
             "此外，需要注意一下几点特殊说明：1. 尽量不要向用户透露书库的各种元信息(除非用户要求给出)，例如书籍id等等，这些你自己知道就好，工具调用时会用到，"
             "2. 除非用户直接问你详细剧情，不然尽量不要剧透，或者如果需要通过详细剧情来回答问题时，需要有剧透提醒，并询问用户许可后才能包含剧透内容"
         )
@@ -228,6 +230,15 @@ class CalibreAgent:
     # ------------------------------------------------------------------ #
     # Tool execution
     # ------------------------------------------------------------------ #
+    def _run_tool_with_app_context(self, func, **args):
+        if has_app_context():
+            return func(**args)
+
+        from . import app as flask_app
+
+        with flask_app.app_context():
+            return func(**args)
+
     def _execute_function_calls(self, function_calls: List[Dict[str, Any]]):
         for call in function_calls:
             name = call.get("name")
@@ -239,7 +250,7 @@ class CalibreAgent:
                 image_info = None
             else:
                 try:
-                    result = func(**args)
+                    result = self._run_tool_with_app_context(func, **args)
                     payload, image_info = self._normalize_tool_output(result)
                 except Exception as exc:  # pylint: disable=broad-except
                     log.exception("工具 %s 执行失败", name)
@@ -522,4 +533,3 @@ class CalibreAgent:
         if isinstance(obj, list):
             return [self._strip_inline_file_path(item) for item in obj]
         return obj
-

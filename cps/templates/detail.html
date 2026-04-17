@@ -6,6 +6,83 @@
       <meta property="og:description" content="{{ entry.comments[0].text|striptags|truncate(65) }}" />
       <meta property="og:image" content="{{url_for('web.get_cover', book_id=entry.id, resolution='og', c=entry|last_modified)}}" />
     {% endif %}
+    <style>
+        .comorag-index-panel {
+            margin-top: 12px;
+            border-radius: 8px;
+            border-color: #dcdcdc;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+        }
+        .comorag-index-panel .panel-heading {
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+        }
+        .comorag-index-status {
+            margin-bottom: 10px;
+        }
+        .comorag-index-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .comorag-index-loading {
+            display: none;
+            margin-left: 2px;
+        }
+        .comorag-index-phase {
+            margin-top: 8px;
+            font-size: 12px;
+        }
+        .comorag-index-badge {
+            margin-left: auto;
+        }
+        .comorag-index-badge.is-running {
+            background-color: #337ab7;
+        }
+        .comorag-index-badge.is-ready {
+            background-color: #5cb85c;
+        }
+        .comorag-index-badge.is-idle {
+            background-color: #777;
+        }
+        .comorag-index-badge.is-error {
+            background-color: #d9534f;
+        }
+        .comorag-index-log-box {
+            margin-top: 8px;
+            max-height: 220px;
+            overflow-y: auto;
+            border-radius: 6px;
+            border: 1px solid #e4e4e4;
+            background: #f9f9f9;
+            padding: 10px;
+            font-family: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        body.blur .comorag-index-panel {
+            border-color: rgba(255, 255, 255, 0.15);
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+        }
+        body.blur .comorag-index-log-box {
+            background: rgba(255, 255, 255, 0.06);
+            border-color: rgba(255, 255, 255, 0.12);
+            color: #f3f5f7;
+        }
+        @media (max-width: 767px) {
+            .comorag-index-log-box {
+                max-height: 160px;
+                font-size: 11px;
+                padding: 8px;
+            }
+            .comorag-index-badge {
+                margin-left: 0;
+            }
+        }
+    </style>
 {% endblock %}
 {% block body %}
 <div class="single">
@@ -279,25 +356,26 @@
                     {% endif %}
                 </div>
 
-                <div class="comorag-index-panel panel panel-default" style="margin-top: 12px;">
+                <div class="comorag-index-panel panel panel-default">
                     <div class="panel-heading">
                         <strong>ComoRAG Index</strong>
                     </div>
                     <div class="panel-body">
                         <input type="hidden" id="comorag_csrf_token" name="csrf_token" value="{{ csrf_token() }}">
-                        <p id="comorag-index-status-text" class="text-muted" style="margin-bottom: 10px;">
+                        <p id="comorag-index-status-text" class="text-muted comorag-index-status">
                             正在读取索引状态...
                         </p>
-                        <button id="comorag-build-index-btn" class="btn btn-sm btn-primary" type="button" disabled>
-                            构建索引
-                        </button>
-                        <span id="comorag-index-loading" class="text-muted" style="margin-left: 8px; display: none;">
-                            处理中...
-                        </span>
-                        <div id="comorag-index-phase" class="text-info" style="margin-top: 8px;"></div>
-                        <div id="comorag-index-log-box"
-                             style="margin-top: 8px; max-height: 180px; overflow-y: auto; background: #f8f8f8; padding: 8px; border-radius: 4px; font-size: 12px;">
+                        <div class="comorag-index-toolbar">
+                            <button id="comorag-build-index-btn" class="btn btn-sm btn-primary" type="button" disabled>
+                                构建索引
+                            </button>
+                            <span id="comorag-index-loading" class="text-muted comorag-index-loading">
+                                处理中...
+                            </span>
+                            <span id="comorag-index-badge" class="label comorag-index-badge is-idle">空闲</span>
                         </div>
+                        <div id="comorag-index-phase" class="text-info comorag-index-phase"></div>
+                        <div id="comorag-index-log-box" class="comorag-index-log-box"></div>
                     </div>
                 </div>
             {% endif %}
@@ -400,32 +478,96 @@
         var loadingEl = document.getElementById("comorag-index-loading");
         var phaseEl = document.getElementById("comorag-index-phase");
         var logBoxEl = document.getElementById("comorag-index-log-box");
+        var badgeEl = document.getElementById("comorag-index-badge");
         var csrfEl = document.getElementById("comorag_csrf_token");
-        if (!statusEl || !buildBtn || !loadingEl || !phaseEl || !logBoxEl || !csrfEl) {
+        if (!statusEl || !buildBtn || !loadingEl || !phaseEl || !logBoxEl || !badgeEl || !csrfEl) {
             return;
         }
 
         var statusUrl = "{{ url_for('ai.comorag_index_status', book_id=entry.id) }}";
         var buildUrl = "{{ url_for('ai.comorag_build_index', book_id=entry.id) }}";
+        var pollTimer = null;
+        var pollIntervalMs = 3000;
+        var requestInFlight = false;
+        var resumePollingWhenVisible = false;
+        var lastLogsText = null;
 
         function setLoading(isLoading) {
             loadingEl.style.display = isLoading ? "inline" : "none";
         }
 
-        function renderLogs(logs) {
-            if (!logs || !logs.length) {
-                logBoxEl.textContent = "暂无任务日志";
+        function setBadge(kind, label) {
+            badgeEl.textContent = label;
+            badgeEl.className = "label comorag-index-badge";
+            if (kind === "running") {
+                badgeEl.className += " is-running";
                 return;
             }
-            var lines = logs.map(function(item) {
-                var ts = item.created_at || "";
-                var phase = item.phase || "-";
-                var level = item.level || "INFO";
-                var message = item.message || "";
-                return "[" + ts + "][" + phase + "][" + level + "] " + message;
-            });
-            logBoxEl.textContent = lines.join("\n");
-            logBoxEl.scrollTop = logBoxEl.scrollHeight;
+            if (kind === "ready") {
+                badgeEl.className += " is-ready";
+                return;
+            }
+            if (kind === "error") {
+                badgeEl.className += " is-error";
+                return;
+            }
+            badgeEl.className += " is-idle";
+        }
+
+        function isNearBottom(element, thresholdPx) {
+            return (element.scrollHeight - element.scrollTop - element.clientHeight) <= thresholdPx;
+        }
+
+        function renderLogs(logs) {
+            var shouldStickToBottom = isNearBottom(logBoxEl, 24);
+            var nextText;
+            if (!logs || !logs.length) {
+                nextText = "暂无任务日志";
+            } else {
+                var lines = logs.map(function(item) {
+                    var ts = item.created_at || "";
+                    var phase = item.phase || "-";
+                    var level = item.level || "INFO";
+                    var message = item.message || "";
+                    return "[" + ts + "][" + phase + "][" + level + "] " + message;
+                });
+                nextText = lines.join("\n");
+            }
+
+            if (nextText !== lastLogsText) {
+                logBoxEl.textContent = nextText;
+                lastLogsText = nextText;
+                if (shouldStickToBottom) {
+                    logBoxEl.scrollTop = logBoxEl.scrollHeight;
+                }
+            } else if (!logs || !logs.length) {
+                logBoxEl.scrollTop = 0;
+            }
+        }
+
+        function isRunning(data) {
+            var jobStatus = data && data.job && data.job.status;
+            return !!(data && data.status === "running") || jobStatus === "RUNNING" || jobStatus === "QUEUED";
+        }
+
+        function startPolling() {
+            if (pollTimer !== null) {
+                return;
+            }
+            pollTimer = window.setInterval(function() {
+                if (document.hidden) {
+                    return;
+                }
+                fetchStatus();
+            }, pollIntervalMs);
+        }
+
+        function stopPolling() {
+            if (pollTimer === null) {
+                return;
+            }
+            window.clearInterval(pollTimer);
+            pollTimer = null;
         }
 
         function updateStatusView(data) {
@@ -434,33 +576,46 @@
                 phaseEl.textContent = "";
                 renderLogs([]);
                 buildBtn.disabled = false;
+                setBadge("error", "错误");
+                stopPolling();
                 return;
             }
             var indexed = !!data.indexed;
             var indexedChunks = Number(data.indexed_chunks || 0);
             var totalChunks = Number(data.total_chunks || 0);
-            var running = data.status === "running" || (data.job && (data.job.status === "RUNNING" || data.job.status === "QUEUED"));
+            var running = isRunning(data);
             if (running) {
                 statusEl.textContent = "索引任务进行中 (" + indexedChunks + "/" + totalChunks + " chunks)";
                 buildBtn.textContent = (data.job && data.job.status === "QUEUED") ? "排队中..." : "构建中...";
                 buildBtn.disabled = true;
+                setBadge("running", (data.job && data.job.status === "QUEUED") ? "排队中" : "运行中");
             } else if (indexed) {
                 statusEl.textContent = "已构建索引 (" + indexedChunks + "/" + totalChunks + " chunks)";
                 buildBtn.textContent = "重建索引";
                 buildBtn.disabled = false;
+                setBadge("ready", "完成");
             } else {
                 statusEl.textContent = "未完成索引 (" + indexedChunks + "/" + totalChunks + " chunks)";
                 buildBtn.textContent = "构建索引";
                 buildBtn.disabled = false;
+                setBadge("idle", "未构建");
             }
             var phase = data.job && data.job.phase ? data.job.phase : "-";
             var message = data.job && data.job.message ? data.job.message : "";
             phaseEl.textContent = "阶段: " + phase + (message ? " | " + message : "");
             renderLogs(data.logs || []);
+            if (running) {
+                startPolling();
+            } else {
+                stopPolling();
+            }
         }
 
         function fetchStatus() {
-            setLoading(false);
+            if (requestInFlight) {
+                return;
+            }
+            requestInFlight = true;
             $.getJSON(statusUrl)
                 .done(function(resp) {
                     updateStatusView(resp);
@@ -473,11 +628,14 @@
                     updateStatusView({status: "error", message: msg});
                 })
                 .always(function() {
+                    requestInFlight = false;
                 });
         }
 
         buildBtn.addEventListener("click", function() {
             setLoading(true);
+            buildBtn.disabled = true;
+            startPolling();
             $.ajax({
                 url: buildUrl,
                 method: "POST",
@@ -500,8 +658,19 @@
             });
         });
 
+        document.addEventListener("visibilitychange", function() {
+            if (document.hidden) {
+                resumePollingWhenVisible = pollTimer !== null;
+                stopPolling();
+                return;
+            }
+            if (resumePollingWhenVisible) {
+                resumePollingWhenVisible = false;
+                fetchStatus();
+            }
+        });
+
         fetchStatus();
-        setInterval(fetchStatus, 3000);
     })();
 </script>
 

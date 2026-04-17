@@ -107,7 +107,6 @@ class ComoRAG:
                                                    os.path.join(self.working_dir, "fact_embeddings"),
                                                    self.global_config.embedding_batch_size, 'fact', self.book_id)
         self.ready_to_retrieve = False
-        self.flag_cluster = False
         self.sem_embedding_store = None
         self.epi_embedding_store = None
         self.summarization_model = None
@@ -229,8 +228,6 @@ class ComoRAG:
                 self.book_id,
             )
 
-        self.flag_cluster = bool(self.sem_embedding_store.get_all_ids())
-
         if self.summarization_model is None:
             self.summarization_model = CommSummarizationModel(
                 self.global_config.llm_name,
@@ -244,7 +241,7 @@ class ComoRAG:
                 summarization_model=self.summarization_model,
                 book_id=self.book_id,
             )
-        if self.clustering is None and not self.flag_cluster:
+        if self.clustering is None:
             self.clustering = ChunkSoftClustering(
                 embedding_store=self.ver_embedding_store,
                 reduction_dimension=10,
@@ -296,8 +293,6 @@ class ComoRAG:
         self.ent_node_to_num_chunk = {}
         self.ready_to_retrieve = False
         self.query_to_embedding = {'triple': {}, 'passage': {}}
-        if self.sem_embedding_store is not None:
-            self.flag_cluster = bool(self.sem_embedding_store.get_all_ids())
         self._restore_graph_runtime_state()
 
     def _restore_graph_runtime_state(self):
@@ -358,12 +353,18 @@ class ComoRAG:
             if str(row.get("content") or "").strip()
         }
 
-        all_openie_info, chunk_keys_to_process = self.load_existing_openie(chunks.keys())
-        new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
-
-        if len(chunk_keys_to_process) > 0:
-            new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
-            self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
+        all_openie_info = []
+        if chunks:
+            ner_results_dict, triple_results_dict = self.openie.batch_openie(chunks)
+            all_openie_info = [
+                {
+                    "idx": chunk_key,
+                    "passage": row["content"],
+                    "extracted_entities": ner_results_dict[chunk_key].unique_entities,
+                    "extracted_triples": triple_results_dict[chunk_key].triples,
+                }
+                for chunk_key, row in chunks.items()
+            ]
 
         if self.global_config.save_openie:
             self.save_openie_results(all_openie_info)
@@ -410,7 +411,7 @@ class ComoRAG:
             self.timeline_summarizer.load_all_summaries()
             self.level_store = self.timeline_summarizer.get_level_embedding_store(0)
 
-        if self.global_config.need_cluster and not self.flag_cluster:
+        if self.global_config.need_cluster:
             ver_hash_ids = self.ver_embedding_store.get_all_ids()
             ver_texts = [self.ver_embedding_store.get_row(hash_id)['content'] for hash_id in ver_hash_ids]
             ver_order_map = self.ver_embedding_store.get_hash_id_to_order()
@@ -426,11 +427,18 @@ class ComoRAG:
                 f.write(final_summary[0])
 
         chunks = self.ver_embedding_store.get_text_for_all_rows()
-        all_openie_info, chunk_keys_to_process = self.load_existing_openie(chunks.keys())
-        new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
-        if len(chunk_keys_to_process) > 0:
-            new_ner_results_dict, new_triple_results_dict = self.openie.batch_openie(new_openie_rows)
-            self.merge_openie_results(all_openie_info, new_openie_rows, new_ner_results_dict, new_triple_results_dict)
+        all_openie_info = []
+        if chunks:
+            ner_results_dict_new, triple_results_dict_new = self.openie.batch_openie(chunks)
+            all_openie_info = [
+                {
+                    "idx": chunk_key,
+                    "passage": row["content"],
+                    "extracted_entities": ner_results_dict_new[chunk_key].unique_entities,
+                    "extracted_triples": triple_results_dict_new[chunk_key].triples,
+                }
+                for chunk_key, row in chunks.items()
+            ]
         if self.global_config.save_openie:
             self.save_openie_results(all_openie_info)
         ner_results_dict, triple_results_dict = reformat_openie_results(all_openie_info)
@@ -464,12 +472,28 @@ class ComoRAG:
         
         chunk_triples = [[text_processing(t) for t in triple_results_dict[chunk_id].triples] for chunk_id in chunk_ids]
         entity_nodes, chunk_triple_entities = extract_entity_nodes(chunk_triples)
-        facts = flatten_facts(chunk_triples)
+        ver_order_map = self.ver_embedding_store.get_hash_id_to_order()
+        fact_to_source_orders: Dict[str, Set[int]] = {}
+        for chunk_id, triples in zip(chunk_ids, chunk_triples):
+            order_id = ver_order_map.get(chunk_id)
+            for triple in triples:
+                if len(triple) != 3:
+                    continue
+                fact_text = str(tuple(triple))
+                if fact_text not in fact_to_source_orders:
+                    fact_to_source_orders[fact_text] = set()
+                if order_id is not None and order_id >= 0:
+                    fact_to_source_orders[fact_text].add(int(order_id))
+        fact_texts = list(fact_to_source_orders.keys())
+        fact_source_order_ids = [sorted(fact_to_source_orders[f]) for f in fact_texts]
         logger.info(f"Encoding Entities")
         self.entity_embedding_store.insert_strings(entity_nodes)
 
         logger.info(f"Encoding Facts")
-        self.fact_embedding_store.insert_strings([str(fact) for fact in facts])
+        self.fact_embedding_store.insert_strings(
+            fact_texts,
+            source_order_ids=fact_source_order_ids,
+        )
 
         logger.info(f"Constructing Graph")
         self.node_to_node_stats = {}
@@ -981,62 +1005,6 @@ class ComoRAG:
                         num_nns += 1
 
             synonym_candidates.append((node_key, synonyms))
-
-    def load_existing_openie(self, chunk_keys: List[str]) -> Tuple[List[dict], Set[str]]:
-
-        chunk_keys = list(chunk_keys)
-        chunk_key_set = set(chunk_keys)
-        chunk_keys_to_save: Set[str] = set()
-
-        if os.path.isfile(self.openie_results_path):
-            openie_results = json.load(open(self.openie_results_path))
-            all_openie_info = openie_results.get('docs', [])
-
-            # Normalize old cache records and deduplicate by chunk idx.
-            dedup_openie: Dict[str, dict] = {}
-            for openie_info in all_openie_info:
-                idx = openie_info.get('idx')
-                if idx in chunk_key_set:
-                    normalized = dict(openie_info)
-                    normalized['idx'] = idx
-                    dedup_openie[idx] = normalized
-                    continue
-                if not idx:
-                    passage = openie_info.get('passage', '')
-                    idx = compute_mdhash_id(passage, 'chunk-')
-                # Keep only chunks in current indexing scope.
-                if idx in chunk_key_set:
-                    normalized = dict(openie_info)
-                    normalized['idx'] = idx
-                    dedup_openie[idx] = normalized
-
-            all_openie_info = list(dedup_openie.values())
-
-            existing_openie_keys = set([info['idx'] for info in all_openie_info])
-
-            for chunk_key in chunk_keys:
-                if chunk_key not in existing_openie_keys:
-                    chunk_keys_to_save.add(chunk_key)
-        else:
-            all_openie_info = []
-            chunk_keys_to_save = chunk_keys
-
-        return all_openie_info, chunk_keys_to_save
-
-    def merge_openie_results(self,
-                             all_openie_info: List[dict],
-                             chunks_to_save: Dict[str, dict],
-                             ner_results_dict: Dict[str, NerRawOutput],
-                             triple_results_dict: Dict[str, TripleRawOutput]) -> List[dict]:
-
-        for chunk_key, row in chunks_to_save.items():
-            passage = row['content']
-            chunk_openie_info = {'idx': chunk_key, 'passage': passage,
-                                 'extracted_entities': ner_results_dict[chunk_key].unique_entities,
-                                 'extracted_triples': triple_results_dict[chunk_key].triples}
-            all_openie_info.append(chunk_openie_info)
-
-        return all_openie_info
 
     def save_openie_results(self, all_openie_info: List[dict]):
 

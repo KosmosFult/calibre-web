@@ -402,7 +402,15 @@ def _build_chunk_rows_for_book(book_id: int, chapter_indices: Optional[List[int]
     normalized_indices = _normalize_chapter_indices(chapter_indices)
     if normalized_indices is not None:
         allowed = set(normalized_indices)
+
+        # for test
+        if book_id == 19:
+            allowed = {2, 3, 9}
+            target_pos = chapter_docs[9]['text'].find("。……接下来")
+            chapter_docs[9]['text'] = chapter_docs[9]['text'][:target_pos]
+
         chapter_docs = [chapter for chapter in chapter_docs if int(chapter.get("index", -1)) in allowed]
+
     chunks = parser._chunk_chapters(book_id=int(book_id), chapters=chapter_docs)
     return [chunk.to_rag_row() for chunk in chunks]
 

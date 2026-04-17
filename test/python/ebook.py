@@ -14,7 +14,7 @@ from cps.comorag import ComoRAG
 from cps.book_content_extractor import BookContentExtractor
 from ebooklib import epub
 from cps.ai_search.chunking import BookParser
-from cps.ai_db import get_session, BookChunk
+# from cps.ai_db import get_session, BookChunk
 
 
 def read_epub(path):
@@ -40,13 +40,15 @@ def build_smoke_docs():
     Use BookParser chunking logic without requiring Flask app context.
     We parse EPUB directly, then call parser internals to split into chunks.
     """
-    epub_path = "/Users/kosmosfult/Documents/books/世界树之棺 - 筒城灯士郎.epub"
+    # epub_path = "/Users/kosmosfult/Documents/books/世界树之棺 - 筒城灯士郎.epub"
+    epub_path = "/Users/kosmosfult/Documents/books/你的解谜由我作答2 拥住那副肩膀的觉悟 - 紙城境介.epub"
+
     # epub_path = "/Users/kosmosfult/Documents/books/永劫馆超连续杀人事件魔女决定与X赴死 ([日]南海游,译者李影恒) (z-library.sk, 1lib.sk, z-lib.sk).epub"
 
     parser = BookParser(chunk_size=800, chunk_overlap=200, enable_contextual=False)
     book = epub.read_epub(epub_path)
     chapter_docs = parser._extract_chapters(book)
-    chunks = parser._chunk_chapters(book_id=13, chapters=chapter_docs)
+    chunks = parser._chunk_chapters(book_id=19, chapters=chapter_docs)
     return [chunk.text for chunk in chunks]
 
 

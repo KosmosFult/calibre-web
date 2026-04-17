@@ -41,3 +41,6 @@ gmail.json
 outputs/
 lancedb/
 runtime/
+
+# AI documentation
+CLAUDE.md

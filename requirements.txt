@@ -28,24 +28,4 @@ certifi>=2024.7.4,<2025.8.24
 ebooklib>=0.20
 lancedb>=0.25.3
 beautifulsoup4>=4.14.2
-google-genai>=1.52.0
-langchain-text-splitters>=1.0.0
-
-
-# Core dependencies for ComoRAG API mode (mac-friendly)
-pyarrow==19.0.1
-pydantic==2.10.4
-tqdm==4.67.1
-openai>=1.77.0
-httpx==0.28.1
-tenacity==8.2.3
-filelock==3.18.0
-tiktoken==0.9.0
-python-dotenv>=1.1.0
-anyio>=3.7.1
-python-igraph>=0.11.8
-pandas>=2.2.3
-
-# For clustering / semantic timeline features (need_cluster=True)
-umap-learn>=0.5.5
-
+openai>=2.8.1,<3.0.0

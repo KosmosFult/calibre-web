@@ -161,33 +161,36 @@ advanced:
   # 信任的主机列表（逗号分隔）
   # trusted_hosts: "example.com,sub.example.com"
 
-# AI (Gemini Agent) 配置
+# AI / OpenAI-compatible Agent 配置
 ai:
-  genai:
-    # 建议优先在环境变量配置密钥；若你希望集中管理，也可直接写在这里
+  # AI 数据与 Calibre metadata.db 完全分离。
+  # ai_storage_dir: "./ai_storage"
+  openai:
+    # 建议优先使用 OPENAI_API_KEY 环境变量。
     # api_key: ""
-    # base_url: ""
-    model: "gemini-3-flash-preview"
+    # 兼容 OpenAI 协议的其他厂商可配置 base_url 与模型名。
+    # base_url: "https://api.openai.com/v1"
+    chat_model: "gpt-5.6-terra"
+    api_mode: "responses" # responses / chat_completions；不支持 Responses 时会自动回退
     # system_prompt: "自定义系统提示词"
-    enable_search: false
-
-# ComoRAG 配置
-comorag:
-  # 建议优先在环境变量配置密钥；若你希望集中管理，也可直接写在这里
-  # api_key: ""
-  base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
-  llm_model: "gemini-3.1-flash-lite-preview"
-  embedding_model: "gemini-embedding-2-preview"
-  need_cluster: true
-  openie_mode: "online" # online / offline
-  chunk_size: 800
-  chunk_overlap: 100
-  enable_contextual: false
-  # 可选：覆盖默认工作目录（支持相对项目根目录或绝对路径）
-  # runtime_dir: "cps/comorag/runtime"
+    timeout_seconds: 120
+    max_retries: 3
+  novel:
+    extraction_model: "gpt-5.6-terra"
+    reasoning_model: "gpt-5.6-terra"
+    embedding_model: "text-embedding-3-small"
+    chunk_chars: 2400
+    chunk_overlap_paragraphs: 1
+    extraction_batch_size: 4
+    embedding_batch_size: 64
+    arc_chapters: 8
+    retrieval_limit: 14
+    max_reasoning_rounds: 3
+    graph_hops: 2
+    keep_index_runs: 2
+    auto_index_on_question: true
 
 # 自定义配置（扩展用）
 # custom:
 #   your_feature_1: value1
 #   your_feature_2: value2
-
